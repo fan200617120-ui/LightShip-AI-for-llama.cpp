@@ -100,7 +100,9 @@ LightShipAI/
 适用于：`chat_Ai.py` / `chat_Ai_no.py` / `ai_buddy.py`
 
 ### 📱 界面布局
-
+<div align="center">
+<img src="https://github.com/fan200617120-ui/LightShip-AI-for-llama.cpp/blob/main/image/chat_Ai_no.png" width="600">
+</div>
 
 ### ⚙️ 关键设置项说明
 | 设置项 | 说明 |
@@ -124,7 +126,7 @@ LightShipAI/
 
 ---
 
-## 🎭 特色功能：ai_buddy.py 专属
+##  特色功能：ai_buddy.py 专属
 ### 💖 性格预设
 - 12 种风格：温柔体贴、活泼开朗、古风雅韵、赛博朋克等
 - 支持一键填充到自定义系统提示词
@@ -164,9 +166,14 @@ LightShipAI/
 | 批量复制并重命名 | 统一重命名，不改动原始文件 |
 | 在线AI入口 | 一键打开 DeepL / 豆包 / Kimi 等，内置提示词模板 |
 
+### 📱 界面布局
+<div align="center">
+<img src="https://github.com/fan200617120-ui/LightShip-AI-for-llama.cpp/blob/main/image/format_converterw.png" width="600">
+</div>
+
 ### 📁 输出目录
 所有转换文件保存在：
-`F:\AItools\LLM\output\`
+`X:\AItools\LLM\output\`
 
 ---
 
