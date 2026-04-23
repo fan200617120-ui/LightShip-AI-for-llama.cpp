@@ -914,7 +914,7 @@ def is_format_converter_running(port):
         return False
 
 def launch_format_converter():
-    port = 7969
+    port = 7966
     url = f"http://127.0.0.1:{port}"
     if is_format_converter_running(port):
         webbrowser.open(url)

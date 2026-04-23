@@ -1,7 +1,6 @@
-# ai_buddy_llama.py - 基于 llama.cpp 后端的 AI 助手（聊天 + 在线入口）
-# 轻量增强版：保留原有温馨界面，新增自定义系统提示词、多模态模式、导出对话
-# 已添加 GPU 层数控制滑块，支持视觉模型 CPU 运行，EXIF自动旋转
-# 优化版 - 2026.04
+# ai_buddy_llama.py - 基于 llama.cpp 后端的 AI 助手（聊天 + 在线入口 + 转换工具箱启动）
+# 增强版：修复 PDF 导出、添加工具箱按钮
+# Copyright 2026 光影的故事2018
 
 import gradio as gr
 import requests
@@ -181,7 +180,6 @@ class PersonalityConfig:
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     loaded_config = json.load(f)
-                # 确保新字段存在
                 for key in default_config:
                     if key not in loaded_config:
                         loaded_config[key] = default_config[key]
@@ -219,7 +217,6 @@ class PersonalityConfig:
         custom = self.config.get("custom_system_prompt", "").strip()
         if custom:
             return custom
-        # 生成默认风格系统提示词
         current_date = datetime.now().strftime("%Y年%m月%d日")
         return f"""今天是 {current_date}。你叫{self.config['name']}，性格{self.config['personality']}，心情{self.config['mood']}。
 {self.config['style']}
@@ -456,9 +453,7 @@ class AIBuddy:
     def encode_image_to_base64(self, image_path: str) -> Optional[str]:
         try:
             img = Image.open(image_path)
-            # 🔥 EXIF自动旋转
             img = ImageOps.exif_transpose(img)
-            # 保存为临时JPEG以获取base64
             img_format = 'jpeg'
             mime_type = f"image/{img_format}"
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
@@ -473,7 +468,6 @@ class AIBuddy:
             return None
 
     def build_messages_with_memory(self, message: str, image_data_url: Optional[str] = None, model_name: str = "") -> List[Dict]:
-        # 获取系统提示词（优先自定义，否则预设）
         system_content = self.personality.get_effective_system_prompt()
 
         recent_memories = self.memory_manager.get_recent_memories(3)
@@ -553,7 +547,6 @@ class AIBuddy:
             self._unregister_session(session_id)
             return
 
-        # 多模态模式处理
         enable_vision = True
         force_cpu_vision = False
         if vision_mode == "禁用多模态":
@@ -739,7 +732,7 @@ def open_url(url):
 def update_prompt(prompt_name):
     return PROMPTS.get(prompt_name, "")
 
-# ========== 导出功能（含容错） ==========
+# ========== 导出功能（增强版：含引擎检测、中文字体、YAML剥离、降级.txt） ==========
 SCRIPT_DIR = Path(__file__).parent.resolve()
 PANDOC_PATH = SCRIPT_DIR.parent / "pandoc" / "pandoc.exe"
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
@@ -763,11 +756,27 @@ def strip_html_tags(text) -> str:
     text = re.sub(r'</strong>', '', text)
     text = re.sub(r'<br\s*/?>', '\n', text)
     text = re.sub(r'<[^>]+>', '', text)
+    import html
+    text = html.unescape(text)
     return text.strip()
+
+def detect_chinese_font():
+    """检测系统中可用的中文字体（Windows 返回 SimSun）"""
+    if os.name == "nt":
+        return "SimSun"
+    for font in ["Noto Serif CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei"]:
+        try:
+            result = subprocess.run(["fc-list", f":family={font}"], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                return font
+        except:
+            continue
+    return None
 
 def export_full_chat_from_memories(memories: List[Dict], target_format: str):
     if not memories:
         return None, "没有对话记忆可导出。"
+
     lines = []
     for mem in memories:
         lines.append(f"## 用户\n\n{mem['user']}\n\n")
@@ -787,38 +796,74 @@ def export_full_chat_from_memories(memories: List[Dict], target_format: str):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}{tgt_ext}"
 
+    pdf_engine = None
+    if target_format == "PDF":
+        for eng in ["xelatex", "pdflatex", "lualatex"]:
+            try:
+                subprocess.run([eng, "--version"], capture_output=True, timeout=2, check=True)
+                pdf_engine = eng
+                break
+            except:
+                continue
+        if pdf_engine is None:
+            txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(full_md)
+            return str(txt_path), "没有找到 LaTeX 引擎，已降级保存为纯文本。"
+
     def run_pandoc(md_text, reader):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
             f.write(md_text)
             temp_md = f.name
         extra_args = []
         if target_format == "PDF":
-            extra_args = ["--pdf-engine", "xelatex"]
-        cmd = [str(PANDOC_PATH), temp_md, "-f", reader, "-t", writer, "-o", str(output_path)] + extra_args
+            extra_args = ["--pdf-engine", pdf_engine]
+            font = detect_chinese_font()
+            if font and pdf_engine in ["xelatex", "lualatex"]:
+                extra_args.extend(["-V", f"mainfont={font}"])
+        cmd = [
+            str(PANDOC_PATH), temp_md, "-f", reader, "-t", writer,
+            "-o", str(output_path), "--wrap=preserve"
+        ] + extra_args
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
             return True, None
         except subprocess.CalledProcessError as e:
             return False, e.stderr
         finally:
-            os.unlink(temp_md)
+            try:
+                os.unlink(temp_md)
+            except OSError:
+                pass
 
-    ok, err = run_pandoc(full_md, "markdown-yaml_metadata_block")
-    if ok:
+    readers = ["markdown+hard_line_breaks-yaml_metadata_block", "markdown+hard_line_breaks"]
+    success = False
+    last_error = ""
+    for reader in readers:
+        ok, err = run_pandoc(full_md, reader)
+        if ok:
+            success = True
+            break
+        last_error = err
+        if err and ("YAML" in err or "metadata" in err):
+            stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', full_md, flags=re.DOTALL)
+            if stripped != full_md and stripped.strip():
+                ok2, err2 = run_pandoc(stripped, "markdown+hard_line_breaks-yaml_metadata_block")
+                if ok2:
+                    success = True
+                    break
+                last_error = err2
+
+    if success:
         return str(output_path), f"导出成功：{output_path.name}"
 
-    stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', full_md, flags=re.DOTALL)
-    if stripped != full_md and stripped.strip():
-        ok, err = run_pandoc(stripped, "markdown-yaml_metadata_block")
-        if ok:
-            return str(output_path), f"导出成功：{output_path.name} (已忽略YAML头部)"
-
     try:
-        with open(output_path, 'w', encoding='utf-8') as f:
+        txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
+        with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(full_md)
-        return str(output_path), f"导出成功：{output_path.name} (纯文本模式)"
+        return str(txt_path), f"Pandoc 转换失败，已降级保存为纯文本。"
     except Exception as e:
-        return None, f"导出失败：{str(e)}"
+        return None, f"所有尝试均失败。最后错误：{last_error}；纯文本保存失败：{e}"
 
 def open_chat_export_dir():
     CHAT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -827,6 +872,36 @@ def open_chat_export_dir():
     else:
         webbrowser.open(str(CHAT_EXPORT_DIR))
     return f"已打开导出目录：{CHAT_EXPORT_DIR}"
+
+# ========== 一键启动转换工具箱 ==========
+def is_format_converter_running(port=7966):
+    try:
+        r = requests.get(f"http://127.0.0.1:{port}", timeout=1)
+        return r.status_code == 200 and ("轻舟 AI 工具箱" in r.text or "format_converter" in r.text)
+    except:
+        return False
+
+def launch_format_converter():
+    port = 7966
+    url = f"http://127.0.0.1:{port}"
+    if is_format_converter_running(port):
+        webbrowser.open(url)
+        return f"✅ 转换工具箱已在运行，浏览器已打开 {url}"
+    script_path = SCRIPT_DIR.parent / "pandoc" / "format_converter.py"
+    if not script_path.exists():
+        return f"❌ 未找到转换器脚本：{script_path}"
+    try:
+        subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        )
+        time.sleep(2)
+        webbrowser.open(url)
+        return f"✅ 转换工具箱已启动，浏览器已打开 {url}"
+    except Exception as e:
+        return f"❌ 启动失败：{str(e)}"
 
 # ========== Gradio 界面 ==========
 custom_css = """
@@ -889,7 +964,7 @@ def create_chat_interface(ai_buddy, personality_config, config):
                     placeholder="在这里输入你想说的话...（按Enter发送）",
                     lines=8,
                     max_lines=16
-                )    
+                )
                 with gr.Row():
                     send_btn = gr.Button("发送消息", variant="primary")
                     stop_btn = gr.Button("停止生成", variant="secondary")
@@ -905,12 +980,11 @@ def create_chat_interface(ai_buddy, personality_config, config):
                     )
                     export_btn = gr.Button("导出对话", variant="primary", scale=1)
                     open_export_dir_btn = gr.Button("打开目录", variant="secondary", scale=1)
-                export_file = gr.File(label="下载导出的文件", visible=True, height=35)
+                export_file = gr.File(label="下载导出的文件", visible=True, height=50)
 
-            with gr.Column(scale=1):             
-                with gr.Group(elem_id="control-panel"):                  
+            with gr.Column(scale=1):
+                with gr.Group(elem_id="control-panel"):
 
-                    # ===== 模型选择 =====
                     model_choice = gr.Dropdown(
                         choices=[],
                         value=None,
@@ -918,7 +992,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
                     )
                     refresh_models_btn = gr.Button("🔄 刷新模型列表", variant="secondary", size="sm")
 
-                    # ===== 自定义系统提示词 =====
                     gr.Markdown("### 系统提示词")
                     custom_prompt_box = gr.Textbox(
                         label="自定义系统提示词（留空则使用下方性格预设）",
@@ -930,7 +1003,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
                         apply_prompt_btn = gr.Button("应用自定义", size="sm")
                         reset_prompt_btn = gr.Button("重置为预设", size="sm")
 
-                    # ===== 性格预设 =====
                     gr.Markdown("### 性格预设")
                     personality_choice = gr.Dropdown(
                         choices=[
@@ -954,7 +1026,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
                         update_personality_btn = gr.Button("更新性格", variant="secondary", size="sm")
                         fill_preset_btn = gr.Button("填充到自定义框", variant="secondary", size="sm")
 
-                    # ===== 高级参数 =====
                     gr.Markdown("### 高级参数")
                     temperature_slider = gr.Slider(
                         minimum=0.1,
@@ -981,7 +1052,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
                         info="-1=服务器默认，0=纯CPU，99=全GPU（需服务器支持）"
                     )
 
-                    # ===== 多模态模式 =====
                     gr.Markdown("### 多模态设置")
                     vision_mode = gr.Dropdown(
                         choices=["自动（跟随 GPU 层数）", "仅 CPU（节省显存）", "禁用多模态"],
@@ -990,13 +1060,13 @@ def create_chat_interface(ai_buddy, personality_config, config):
                     )
 
                     check_service_btn = gr.Button("检查 llama.cpp 服务", variant="secondary", size="sm")
-                    
-                    # 图片上传（移到多模态设置下面）
+
                     chat_image_input = gr.Image(
                         label="上传图片（仅多模态模型支持识别）",
                         type="filepath",
                         height=260
-                    )                
+                    )
+                    launch_toolbox_btn = gr.Button("🧰 打开转换工具箱", variant="secondary", size="sm")
 
         session_state = gr.State("")
 
@@ -1130,20 +1200,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
             else:
                 return gr.update(visible=False), msg
 
-        # 初始化模型列表
-        initial_models = ai_buddy.get_llama_models()
-        if initial_models:
-            model_choices_list = []
-            for m in initial_models:
-                if ai_buddy.is_multimodal(m):
-                    model_choices_list.append((f"{m} (多模态)", m))
-                else:
-                    model_choices_list.append((m, m))
-            model_choice.choices = model_choices_list
-            model_choice.value = model_choices_list[0][1] if model_choices_list else None
-            config.default_model = model_choice.value
-            
-        # ========== 事件处理函数定义（放在绑定之前） ==========
         def fill_preset_to_custom(preset_str):
             preset_map = {
                 "温柔体贴 - 像知心朋友一样温暖": "你叫元元，性格温柔体贴，用温暖、鼓励的语气，像好朋友一样聊天。",
@@ -1161,19 +1217,20 @@ def create_chat_interface(ai_buddy, personality_config, config):
             }
             return preset_map.get(preset_str, "")
 
-        # ========== 事件绑定 ==========
-        update_personality_btn.click(
-            fn=update_personality_from_preset,
-            inputs=[personality_choice, chat_history],
-            outputs=[chat_history]
-        )
-        fill_preset_btn.click(   # 新增绑定
-            fn=fill_preset_to_custom,
-            inputs=[personality_choice],
-            outputs=[custom_prompt_box]
-        )
+        # 初始化模型列表
+        initial_models = ai_buddy.get_llama_models()
+        if initial_models:
+            model_choices_list = []
+            for m in initial_models:
+                if ai_buddy.is_multimodal(m):
+                    model_choices_list.append((f"{m} (多模态)", m))
+                else:
+                    model_choices_list.append((m, m))
+            model_choice.choices = model_choices_list
+            model_choice.value = model_choices_list[0][1] if model_choices_list else None
+            config.default_model = model_choice.value
 
-        # 绑定事件
+        # 事件绑定
         refresh_models_btn.click(fn=refresh_model_list, outputs=[model_choice])
         check_service_btn.click(fn=check_service_and_refresh, outputs=[status_display, model_choice])
         apply_prompt_btn.click(fn=apply_custom_prompt, inputs=[custom_prompt_box], outputs=[status_display])
@@ -1213,9 +1270,23 @@ def create_chat_interface(ai_buddy, personality_config, config):
             fn=open_chat_export_dir,
             outputs=[status_display]
         )
+        update_personality_btn.click(
+            fn=update_personality_from_preset,
+            inputs=[personality_choice, chat_history],
+            outputs=[chat_history]
+        )
+        fill_preset_btn.click(
+            fn=fill_preset_to_custom,
+            inputs=[personality_choice],
+            outputs=[custom_prompt_box]
+        )
+        # 工具箱启动按钮绑定
+        launch_toolbox_btn.click(
+            fn=launch_format_converter,
+            outputs=[status_display]
+        )
 
 def create_online_tab():
-    """在线AI入口 Tab"""
     with gr.Tab("在线AI入口"):
         with gr.Column():
             gr.Markdown("### 快速入口")
