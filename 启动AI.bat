@@ -143,7 +143,7 @@ goto menu
 :format_converter
 echo.
 echo 正在启动 Pandoc 格式转换器...
-echo 转换界面将在浏览器中打开，地址：http://127.0.0.1:7969
+echo 转换界面将在浏览器中打开，地址：http://127.0.0.1:7966
 echo 按 Ctrl+C 可停止服务，或直接关闭命令行窗口。
 echo.
 if not exist "%PYTHON%" (
@@ -160,7 +160,7 @@ if not exist "%PANDOC_SCRIPT%" (
 start "Pandoc格式转换器" cmd /c "%PYTHON% %PANDOC_SCRIPT%"
 :: 等待几秒让服务启动
 timeout /t 3 /nobreak >nul
-start http://127.0.0.1:7969
+start http://127.0.0.1:7966
 echo 转换器已启动。
 echo.
 pause
