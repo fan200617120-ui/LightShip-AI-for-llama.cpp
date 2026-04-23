@@ -3,6 +3,7 @@
 """
 轻舟 AI・LightShip AI - 无记忆聊天 (llama.cpp 后端)
 支持流式输出、思考过程、多模态图片、系统提示词、导出对话、一键唤起转换工具箱
+界面优化：右侧按钮垂直布局，状态栏与导出文件同行
 Copyright 2026 光影的故事2018
 """
 
@@ -397,7 +398,7 @@ def refresh_models():
     choices = get_model_display_list(models)
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
-# ==================== 导出功能（含 YAML 容错） ====================
+# ==================== 导出功能（借鉴 format_converter 增强机制） ====================
 PANDOC_PATH = SCRIPT_DIR.parent / "pandoc" / "pandoc.exe"
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
 CHAT_EXPORT_DIR = OUTPUT_DIR / "chat_exports"
@@ -422,9 +423,26 @@ def strip_html_tags(text) -> str:
     text = re.sub(r'<[^>]+>', '', text)
     return text.strip()
 
+def detect_chinese_font():
+    """检测系统中可用的中文字体（Windows 返回 SimSun，Linux 检查 fc-list）"""
+    import platform
+    if platform.system() == "Windows":
+        return "SimSun"
+    # Linux/macOS 检测
+    for font in ["Noto Serif CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei"]:
+        try:
+            result = subprocess.run(["fc-list", f":family={font}"], capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return font
+        except Exception:
+            continue
+    return None
+
 def export_full_chat(history, target_format):
     if not history:
         return None, "对话为空，无法导出。"
+
+    # 1. 生成 Markdown 文本
     lines = []
     for msg in history:
         role = msg.get("role", "unknown")
@@ -440,6 +458,7 @@ def export_full_chat(history, target_format):
         return None, "无有效对话内容。"
     full_md = "".join(lines)
 
+    # 2. 准备路径和参数
     CHAT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     ext_map = {
         "Microsoft Word (docx)": ".docx",
@@ -453,41 +472,88 @@ def export_full_chat(history, target_format):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}{tgt_ext}"
 
-    def run_pandoc(md_text, reader):
+    # 3. Pandoc 引擎检测（PDF 专用）
+    pdf_engine = None
+    if target_format == "PDF":
+        for eng in ["xelatex", "pdflatex", "lualatex"]:
+            try:
+                subprocess.run([eng, "--version"], capture_output=True, timeout=3, check=True)
+                pdf_engine = eng
+                break
+            except Exception:
+                continue
+        if pdf_engine is None:
+            # 降级为纯文本提示
+            txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(full_md)
+            return str(txt_path), "没有找到 LaTeX 引擎，已降级保存为纯文本。"
+
+    def run_pandoc(md_text: str, reader: str = "markdown+hard_line_breaks-yaml_metadata_block"):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
             f.write(md_text)
             temp_md = f.name
+
         extra_args = []
         if target_format == "PDF":
-            extra_args = ["--pdf-engine", "xelatex"]
-        cmd = [str(PANDOC_PATH), temp_md, "-f", reader, "-t", writer, "-o", str(output_path)] + extra_args
+            extra_args = ["--pdf-engine", pdf_engine]
+            font = detect_chinese_font()
+            # 仅当引擎支持时才传入 mainfont
+            if font and pdf_engine in ["xelatex", "lualatex"]:
+                extra_args.extend(["-V", f"mainfont={font}"])
+
+        cmd = [
+            str(PANDOC_PATH), temp_md,
+            "-f", reader,
+            "-t", writer,
+            "-o", str(output_path),
+            "--wrap=preserve"
+        ] + extra_args
+
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+            os.unlink(temp_md)
             return True, None
         except subprocess.CalledProcessError as e:
-            return False, e.stderr
-        finally:
             os.unlink(temp_md)
+            return False, e.stderr
+        except Exception as e:
+            os.unlink(temp_md)
+            return False, str(e)
 
-    # 尝试1：禁用YAML
-    ok, err = run_pandoc(full_md, "markdown-yaml_metadata_block")
-    if ok:
+    # 4. 尝试多种 reader（与 format_converter 对齐）
+    readers = [
+        "markdown+hard_line_breaks-yaml_metadata_block",
+        "markdown+hard_line_breaks"
+    ]
+    success = False
+    last_error = ""
+    for reader in readers:
+        ok, err = run_pandoc(full_md, reader)
+        if ok:
+            success = True
+            break
+        last_error = err
+        # 若是 YAML 错误，尝试剥离 Front Matter 后用第一个 reader 再试一次
+        if err and ("YAML" in err or "metadata" in err):
+            stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', full_md, flags=re.DOTALL)
+            if stripped != full_md and stripped.strip():
+                ok2, err2 = run_pandoc(stripped, "markdown+hard_line_breaks-yaml_metadata_block")
+                if ok2:
+                    success = True
+                    break
+                last_error = err2
+    if success:
         return str(output_path), f"导出成功：{output_path.name}"
 
-    # 尝试2：剥离Front Matter
-    stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', full_md, flags=re.DOTALL)
-    if stripped != full_md and stripped.strip():
-        ok, err = run_pandoc(stripped, "markdown-yaml_metadata_block")
-        if ok:
-            return str(output_path), f"导出成功：{output_path.name} (已忽略YAML头部)"
-
-    # 尝试3：纯文本兜底
+    # 5. 降级策略：保存为纯文本 .txt（避免生成损坏的 .docx/.pdf）
     try:
-        with open(output_path, 'w', encoding='utf-8') as f:
+        txt_output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
+        with open(txt_output_path, 'w', encoding='utf-8') as f:
             f.write(full_md)
-        return str(output_path), f"导出成功：{output_path.name} (纯文本模式)"
+        return str(txt_output_path), f"Pandoc 转换失败，已降级保存为纯文本：{txt_output_path.name}"
     except Exception as e:
-        return None, f"导出失败：{str(e)}"
+        return None, f"所有尝试均失败。最后错误：{last_error}；纯文本保存失败：{e}"
 
 def open_chat_export_dir():
     CHAT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -573,30 +639,27 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
 
 开始对话："""
                 }],
-                height=750,
+                height=900,
                 sanitize_html=False
             )
+            # 底部操作区：输入框 + 右侧按钮列
             with gr.Row():
-                input_box = gr.Textbox(
-                    label="输入文字",
-                    placeholder="请输入问题... (按回车发送)",
-                    lines=3,
-                    scale=4
-                )
-                send_btn = gr.Button("发送", variant="primary", scale=1)
-                stop_btn = gr.Button("停止", variant="stop", scale=1)
-
-            # 导出控件
-            with gr.Row():
-                export_format = gr.Dropdown(
-                    choices=["Microsoft Word (docx)", "PDF", "HTML", "Markdown", "Plain Text"],
-                    label="导出格式",
-                    value="Microsoft Word (docx)",
-                    scale=2
-                )
-                export_btn = gr.Button("导出对话", variant="primary", scale=1)
-                open_export_dir_btn = gr.Button("打开导出目录", variant="secondary", scale=1)
-            export_file = gr.File(label="下载导出的文件", visible=True, height=50)
+                with gr.Column(scale=3):
+                    input_box = gr.Textbox(
+                        label="输入文字",
+                        placeholder="请输入问题... (按回车发送)",
+                        lines=14
+                    )
+                with gr.Column(scale=1, min_width=150):
+                    send_btn = gr.Button("发送消息", variant="primary")
+                    stop_btn = gr.Button("停止对话", variant="stop")
+                    export_btn = gr.Button("导出对话", variant="primary")
+                    open_export_dir_btn = gr.Button("打开目录", variant="secondary")
+                    export_format = gr.Dropdown(
+                        choices=["Microsoft Word (docx)", "PDF", "HTML", "Markdown", "Plain Text"],
+                        label="导出格式",
+                        value="Microsoft Word (docx)"
+                    )
 
         # 右侧：设置边栏
         with gr.Column(scale=1, min_width=280):
@@ -644,7 +707,8 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
 
     # 底部状态栏
     with gr.Row():
-        status_box = gr.Textbox(label="状态", value="就绪", interactive=False)
+        status_box = gr.Textbox(label="状态", value="就绪", interactive=False, scale=4)
+        export_file = gr.File(label="下载导出的文件", visible=True, height=50, scale=1)
 
     # 事件绑定
     refresh_btn.click(fn=refresh_models, outputs=[model_select])

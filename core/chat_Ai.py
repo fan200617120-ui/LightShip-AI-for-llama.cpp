@@ -4,6 +4,7 @@
 chat_llama.py - 基于 llama.cpp 后端的聊天助手（支持记忆、流式、思考过程、多模态）
 修复流式输出，恢复思考过程显示，支持 GPU 层数调整与对话导出
 新增：自定义系统提示词、多模态模式、界面布局优化
+增强：PDF 导出引擎检测、YAML 剥离容错、图片透明通道修复
 Copyright 2026 光影的故事2018
 """
 
@@ -545,25 +546,6 @@ def refresh_models():
     choices = get_model_display_list(models)
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
-def strip_html_tags(text) -> str:
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
-    text = re.sub(r'<details[^>]*>', '', text)
-    text = re.sub(r'</details>', '', text)
-    text = re.sub(r'<summary[^>]*>', '', text)
-    text = re.sub(r'</summary>', '', text)
-    text = re.sub(r'<div[^>]*>', '', text)
-    text = re.sub(r'</div>', '', text)
-    text = re.sub(r'<em>', '', text)
-    text = re.sub(r'</em>', '', text)
-    text = re.sub(r'<strong>', '', text)
-    text = re.sub(r'</strong>', '', text)
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    return text.strip()
-
 # ==================== 转换工具配置 ====================
 PANDOC_PATH = Path(SCRIPT_DIR).parent / "pandoc" / "pandoc.exe"
 OUTPUT_DIR = Path(SCRIPT_DIR).parent / "output"
@@ -591,6 +573,38 @@ FORMAT_ALIASES = {
 IMAGE_FORMATS = ["PNG", "JPEG", "WebP", "BMP", "TIFF"]
 IMAGE_EXT_MAP = {"PNG": ".png", "JPEG": ".jpg", "WebP": ".webp", "BMP": ".bmp", "TIFF": ".tiff"}
 
+def strip_html_tags(text) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    text = re.sub(r'<details[^>]*>', '', text)
+    text = re.sub(r'</details>', '', text)
+    text = re.sub(r'<summary[^>]*>', '', text)
+    text = re.sub(r'</summary>', '', text)
+    text = re.sub(r'<div[^>]*>', '', text)
+    text = re.sub(r'</div>', '', text)
+    text = re.sub(r'<em>', '', text)
+    text = re.sub(r'</em>', '', text)
+    text = re.sub(r'<strong>', '', text)
+    text = re.sub(r'</strong>', '', text)
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text.strip()
+
+def detect_chinese_font():
+    """检测系统中可用的中文字体（Windows 返回 SimSun）"""
+    if os.name == "nt":
+        return "SimSun"
+    for font in ["Noto Serif CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei"]:
+        try:
+            result = subprocess.run(["fc-list", f":family={font}"], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                return font
+        except:
+            continue
+    return None
+
 def check_pandoc():
     if not PANDOC_PATH.exists():
         return f"未找到 Pandoc：{PANDOC_PATH}"
@@ -604,14 +618,32 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
     tgt_ext = SUPPORTED_FORMATS.get(tgt_format, "")
     reader = FORMAT_ALIASES.get(src_ext, src_ext)
     writer = FORMAT_ALIASES.get(tgt_ext, tgt_ext)
+
+    # PDF 引擎检测及字体处理
+    pdf_engine = None
+    if tgt_ext == ".pdf":
+        for eng in ["xelatex", "pdflatex", "lualatex"]:
+            try:
+                subprocess.run([eng, "--version"], capture_output=True, timeout=2, check=True)
+                pdf_engine = eng
+                break
+            except:
+                continue
+        if pdf_engine is None:
+            return "未找到 LaTeX 引擎，无法生成 PDF（可先导出为 HTML 再打印）。"
+
     extra_args = []
     if tgt_ext == ".pdf":
-        extra_args.extend(["--pdf-engine", "xelatex"])
+        extra_args.extend(["--pdf-engine", pdf_engine])
+        font = detect_chinese_font()
+        if font and pdf_engine in ["xelatex", "lualatex"]:
+            extra_args.extend(["-V", f"mainfont={font}"])
     elif tgt_ext == ".docx":
         if enable_toc:
             extra_args.append("--toc")
         if reference_doc and os.path.exists(reference_doc):
             extra_args.extend(["--reference-doc", reference_doc])
+
     succ, fail = 0, []
     for file_obj in files:
         in_path = Path(file_obj.name)
@@ -621,12 +653,46 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
         while out_path.exists():
             out_path = OUTPUT_DIR / f"{in_name.stem}_{counter}{tgt_ext}"
             counter += 1
-        cmd = [str(PANDOC_PATH), str(in_path), "-f", reader, "-t", writer, "-o", str(out_path)] + extra_args
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+
+        success_flag = False
+        error_msg = ""
+        # 尝试多个 reader（仅对 Markdown 有效）
+        readers_to_try = [reader]
+        if src_ext == ".md":
+            readers_to_try = ["markdown+hard_line_breaks-yaml_metadata_block", "markdown+hard_line_breaks"]
+        for r in readers_to_try:
+            cmd = [str(PANDOC_PATH), str(in_path), "-f", r, "-t", writer, "-o", str(out_path), "--wrap=preserve"] + extra_args
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+                success_flag = True
+                break
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stderr
+                if src_ext == ".md" and ("YAML" in error_msg or "metadata" in error_msg):
+                    try:
+                        with open(in_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', content, flags=re.DOTALL)
+                        if stripped != content and stripped.strip():
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as tmp:
+                                tmp.write(stripped)
+                                tmp_path = tmp.name
+                            try:
+                                cmd2 = [str(PANDOC_PATH), tmp_path, "-f", "markdown+hard_line_breaks", "-t", writer, "-o", str(out_path), "--wrap=preserve"] + extra_args
+                                subprocess.run(cmd2, capture_output=True, text=True, timeout=60, check=True)
+                                success_flag = True
+                            finally:
+                                os.unlink(tmp_path)
+                    except:
+                        pass
+                if success_flag:
+                    break
+
+        if success_flag:
             succ += 1
-        except:
+        else:
             fail.append(in_name.name)
+
     msg = f"成功 {succ} 个"
     if fail:
         msg += f"，失败 {len(fail)} 个"
@@ -647,14 +713,15 @@ def convert_images_func(files, target_format, quality):
             out_path = IMAGE_OUTPUT_DIR / f"{in_name.stem}_{counter}{ext}"
             counter += 1
         try:
-            img = Image.open(in_path) 
+            img = Image.open(in_path)
             img = ImageOps.exif_transpose(img)
+            # 修复 LA 模式透明背景变黑问题
             if target_format in ["JPEG", "WebP"]:
                 if img.mode in ("RGBA", "LA", "P") and target_format == "JPEG":
-                    bg = Image.new("RGB", img.size, (255, 255, 255))
-                    if img.mode == "P":
+                    if img.mode in ("LA", "P"):
                         img = img.convert("RGBA")
-                    bg.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+                    bg = Image.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[-1])   # 此时必为 RGBA
                     img = bg
                 elif img.mode != "RGB" and target_format == "JPEG":
                     img = img.convert("RGB")
@@ -743,13 +810,33 @@ def export_chat_to_format(markdown_text, target_format):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}{tgt_ext}"
 
+    # PDF 引擎检测与字体处理
+    pdf_engine = None
+    if target_format == "PDF":
+        for eng in ["xelatex", "pdflatex", "lualatex"]:
+            try:
+                subprocess.run([eng, "--version"], capture_output=True, timeout=2, check=True)
+                pdf_engine = eng
+                break
+            except:
+                continue
+        if pdf_engine is None:
+            # 无 LaTeX 引擎，直接降级保存为 txt
+            txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_text)
+            return str(txt_path), "没有找到 LaTeX 引擎，已降级保存为纯文本。"
+
     def run_pandoc(md_text, reader):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
             f.write(md_text)
             temp_md = f.name
         extra_args = []
         if target_format == "PDF":
-            extra_args = ["--pdf-engine", "xelatex"]
+            extra_args = ["--pdf-engine", pdf_engine]
+            font = detect_chinese_font()
+            if font and pdf_engine in ["xelatex", "lualatex"]:
+                extra_args.extend(["-V", f"mainfont={font}"])
         cmd = [str(PANDOC_PATH), temp_md, "-f", reader, "-t", writer, "-o", str(output_path)] + extra_args
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
@@ -759,22 +846,36 @@ def export_chat_to_format(markdown_text, target_format):
         finally:
             os.unlink(temp_md)
 
-    ok, err = run_pandoc(markdown_text, "markdown-yaml_metadata_block")
-    if ok:
+    # 尝试多个 reader
+    readers = ["markdown+hard_line_breaks-yaml_metadata_block", "markdown+hard_line_breaks"]
+    success = False
+    last_error = ""
+    for reader in readers:
+        ok, err = run_pandoc(markdown_text, reader)
+        if ok:
+            success = True
+            break
+        last_error = err
+        if err and ("YAML" in err or "metadata" in err):
+            stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', markdown_text, flags=re.DOTALL)
+            if stripped != markdown_text and stripped.strip():
+                ok2, err2 = run_pandoc(stripped, "markdown+hard_line_breaks-yaml_metadata_block")
+                if ok2:
+                    success = True
+                    break
+                last_error = err2
+
+    if success:
         return str(output_path), f"导出成功：{output_path.name}"
 
-    stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', markdown_text, flags=re.DOTALL)
-    if stripped != markdown_text and stripped.strip():
-        ok, err = run_pandoc(stripped, "markdown-yaml_metadata_block")
-        if ok:
-            return str(output_path), f"导出成功：{output_path.name} (已忽略YAML头部)"
-
+    # 降级保存为纯文本
     try:
-        with open(output_path, 'w', encoding='utf-8') as f:
+        txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
+        with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(markdown_text)
-        return str(output_path), f"导出成功：{output_path.name} (纯文本模式)"
+        return str(txt_path), f"Pandoc 转换失败，已降级保存为纯文本。"
     except Exception as e:
-        return None, f"导出失败：{str(e)}"
+        return None, f"所有尝试均失败。最后错误：{last_error}；纯文本保存失败：{e}"
 
 def export_full_chat(history, target_format):
     if not history:
@@ -896,30 +997,27 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
 
 开始对话："""
                         }],
-                        height=750,
+                        height=900,
                         sanitize_html=False
                     )
+                    # 底部操作区：输入框 + 右侧按钮列
                     with gr.Row():
-                        input_box = gr.Textbox(
-                            label="输入文字",
-                            placeholder="请输入问题... (按回车发送)",
-                            lines=3,
-                            scale=4
-                        )
-                        send_btn = gr.Button("发送", variant="primary", scale=1)
-                        stop_btn = gr.Button("停止", variant="stop", scale=1)
-
-                    # 导出控件
-                    with gr.Row():
-                        export_format = gr.Dropdown(
-                            choices=["Microsoft Word (docx)", "PDF", "HTML", "Markdown", "Plain Text"],
-                            label="导出格式",
-                            value="Microsoft Word (docx)",
-                            scale=2
-                        )
-                        export_btn = gr.Button("导出对话", variant="primary", scale=1)
-                        open_export_dir_btn = gr.Button("打开导出目录", variant="secondary", scale=1)
-                    export_file = gr.File(label="下载导出的文件", visible=True, height=50)
+                        with gr.Column(scale=3):
+                            input_box = gr.Textbox(
+                                label="输入文字",
+                                placeholder="请输入问题... (按回车发送)",
+                                lines=15
+                            )
+                        with gr.Column(scale=1, min_width=150):
+                            send_btn = gr.Button("发送消息", variant="primary")
+                            stop_btn = gr.Button("停止对话", variant="stop")
+                            export_btn = gr.Button("导出对话", variant="primary")
+                            open_export_dir_btn = gr.Button("打开目录", variant="secondary")
+                            export_format = gr.Dropdown(
+                                choices=["Microsoft Word (docx)", "PDF", "HTML", "Markdown", "Plain Text"],
+                                label="导出格式",
+                                value="Microsoft Word (docx)"
+                            )
 
                 with gr.Column(scale=1, min_width=280):
                     gr.Markdown("### 系统提示词")
@@ -966,7 +1064,8 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
 
             # 底部状态栏
             with gr.Row():
-                status_box = gr.Textbox(label="状态", value="就绪", interactive=False)
+                status_box = gr.Textbox(label="状态", value="就绪", interactive=False, scale=4)
+                export_file = gr.File(label="下载导出的文件", visible=True, height=50, scale=1)
 
             refresh_btn.click(fn=refresh_models, outputs=[model_select])
             send_btn.click(
