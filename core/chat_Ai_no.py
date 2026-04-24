@@ -4,7 +4,6 @@
 轻舟 AI・LightShip AI - 无记忆聊天 (llama.cpp 后端)
 支持流式输出、思考过程、多模态图片、系统提示词、导出对话、一键唤起转换工具箱
 新增：外挂 JSON 角色预设，一键切换专业提示词
-修复：Chatbot 兼容性、非阻塞启动、流式解析器稳定性
 Copyright 2026 光影的故事2018
 """
 
@@ -114,7 +113,6 @@ class StreamResponseParser:
 
     def parse_chunk(self, chunk_data: dict) -> dict:
         result = {"thought": "", "answer": "", "status": "answering"}
-        # 修复索引越界 BUG
         choices = chunk_data.get("choices", [])
         if not choices:
             return result
@@ -151,7 +149,6 @@ class StreamResponseParser:
                     result["status"] = "thinking"
                     continue
                 else:
-                    # 优化：仅保留不完整标签前缀，避免 buffer 卡死
                     if self.buffer.endswith('<') or self.buffer.endswith('</t') or self.buffer.endswith('</th'):
                         keep_len = min(6, len(self.buffer))
                         safe_part = self.buffer[:-keep_len] if len(self.buffer) > keep_len else ""
@@ -179,7 +176,6 @@ class StreamResponseParser:
                     result["status"] = "answering"
                     continue
                 else:
-                    # 思考中，buffer 过长时强制输出，避免无内容
                     if len(self.buffer) > 200:
                         clean_buf = self._clean_text(self.buffer)
                         self.thought += clean_buf
@@ -401,21 +397,18 @@ def refresh_models():
 
 # ==================== 外挂 JSON 角色预设 ====================
 def load_prompts():
-    """加载同目录下的 chat_prompts.json 文件"""
     json_path = SCRIPT_DIR / "chat_prompts.json"
     if not json_path.exists():
         print(f"警告：未找到角色配置文件 {json_path}")
         return {}
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data
+            return json.load(f)
     except Exception as e:
         print(f"加载角色配置失败: {e}")
         return {}
 
 def get_prompt_options():
-    """从角色库生成下拉菜单选项列表 (显示名称, 角色ID)"""
     prompts_data = load_prompts()
     role_lib = prompts_data.get("角色库", {})
     options = []
@@ -426,7 +419,6 @@ def get_prompt_options():
     return options
 
 def apply_preset(role_id):
-    """根据角色ID返回对应的系统提示词和输入占位符"""
     prompts_data = load_prompts()
     role_lib = prompts_data.get("角色库", {})
     for category, roles in role_lib.items():
@@ -463,11 +455,9 @@ def strip_html_tags(text) -> str:
     return text.strip()
 
 def detect_chinese_font():
-    """检测系统中可用的中文字体（Windows 返回 SimSun，Linux 检查 fc-list）"""
     import platform
     if platform.system() == "Windows":
         return "SimSun"
-    # Linux/macOS 检测
     for font in ["Noto Serif CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei"]:
         try:
             result = subprocess.run(["fc-list", f":family={font}"], capture_output=True, text=True)
@@ -481,7 +471,6 @@ def export_full_chat(history, target_format):
     if not history:
         return None, "对话为空，无法导出。"
 
-    # 1. 生成 Markdown 文本
     lines = []
     for msg in history:
         role = msg.get("role", "unknown")
@@ -497,7 +486,6 @@ def export_full_chat(history, target_format):
         return None, "无有效对话内容。"
     full_md = "".join(lines)
 
-    # 2. 准备路径和参数
     CHAT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     ext_map = {
         "Microsoft Word (docx)": ".docx",
@@ -511,7 +499,6 @@ def export_full_chat(history, target_format):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}{tgt_ext}"
 
-    # 3. Pandoc 引擎检测（PDF 专用）
     pdf_engine = None
     if target_format == "PDF":
         for eng in ["xelatex", "pdflatex", "lualatex"]:
@@ -522,7 +509,6 @@ def export_full_chat(history, target_format):
             except Exception:
                 continue
         if pdf_engine is None:
-            # 降级为纯文本提示
             txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(full_md)
@@ -537,7 +523,6 @@ def export_full_chat(history, target_format):
         if target_format == "PDF":
             extra_args = ["--pdf-engine", pdf_engine]
             font = detect_chinese_font()
-            # 仅当引擎支持时才传入 mainfont
             if font and pdf_engine in ["xelatex", "lualatex"]:
                 extra_args.extend(["-V", f"mainfont={font}"])
 
@@ -560,7 +545,6 @@ def export_full_chat(history, target_format):
             os.unlink(temp_md)
             return False, str(e)
 
-    # 4. 尝试多种 reader（与 format_converter 对齐）
     readers = [
         "markdown+hard_line_breaks-yaml_metadata_block",
         "markdown+hard_line_breaks"
@@ -573,7 +557,6 @@ def export_full_chat(history, target_format):
             success = True
             break
         last_error = err
-        # 若是 YAML 错误，尝试剥离 Front Matter 后用第一个 reader 再试一次
         if err and ("YAML" in err or "metadata" in err):
             stripped = re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', full_md, flags=re.DOTALL)
             if stripped != full_md and stripped.strip():
@@ -585,7 +568,6 @@ def export_full_chat(history, target_format):
     if success:
         return str(output_path), f"导出成功：{output_path.name}"
 
-    # 5. 降级策略：保存为纯文本 .txt（避免生成损坏的 .docx/.pdf）
     try:
         txt_output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
         with open(txt_output_path, 'w', encoding='utf-8') as f:
@@ -612,7 +594,6 @@ def is_port_open(port):
             return False
 
 def is_format_converter_running(port):
-    """检查转换工具箱是否真正在运行（通过 HTTP 请求验证）"""
     try:
         r = requests.get(f"http://127.0.0.1:{port}", timeout=1)
         return r.status_code == 200 and "轻舟 AI 工具箱" in r.text
@@ -620,7 +601,7 @@ def is_format_converter_running(port):
         return False
 
 def launch_format_converter():
-    port = 7966   # 您的实际端口
+    port = 7966
     url = f"http://127.0.0.1:{port}"
     if is_format_converter_running(port):
         webbrowser.open(url)
@@ -640,12 +621,11 @@ def launch_format_converter():
         return f"✅ 转换工具箱已启动，浏览器已打开 {url}"
     except Exception as e:
         return f"❌ 启动失败：{str(e)}"
-    
+
 # ==================== Gradio 界面 ====================
 logo_path = SCRIPT_DIR / "ai_logo.png"
 ico_path = SCRIPT_DIR / "ai_logo.ico"
 
-# 移除阻塞式模型列表获取，改为页面加载后异步执行
 model_choices = []
 
 css = """
@@ -655,8 +635,15 @@ css = """
 """
 
 with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)") as demo:
-    gr.Markdown("# 轻舟 AI・无记忆聊天 (llama.cpp)")
-    gr.Markdown("###### 轻舟渡万境，一智载千寻。")
+    # ========== Logo 和标题行 ==========
+    with gr.Row():
+        if logo_path.exists():
+            gr.Image(str(logo_path), height=50, show_label=False, container=False, scale=0)
+        with gr.Column(scale=1):
+            gr.Markdown("""
+            # 轻舟 AI・LightShip AI (llama.cpp)
+            ###### 轻舟渡万境，一智载千寻。
+            """)
 
     with gr.Row():
         # 左侧：聊天主区域
@@ -679,13 +666,12 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)") as demo:
                 height=900,
                 sanitize_html=False
             )
-            # 底部操作区：输入框 + 右侧按钮列
             with gr.Row():
                 with gr.Column(scale=3):
                     input_box = gr.Textbox(
                         label="输入文字",
                         placeholder="请输入内容...",
-                        lines=14
+                        lines=18
                     )
                 with gr.Column(scale=1, min_width=150):
                     send_btn = gr.Button("发送消息", variant="primary")
@@ -701,7 +687,6 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)") as demo:
         # 右侧：设置边栏
         with gr.Column(scale=1, min_width=280):
             gr.Markdown("### 角色预设")
-            # 加载角色列表
             preset_options = get_prompt_options()
             role_dropdown = gr.Dropdown(
                 choices=preset_options,
@@ -757,11 +742,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)") as demo:
         export_file = gr.File(label="下载导出的文件", visible=True, height=50, scale=1)
 
     # 事件绑定
-    refresh_btn.click(
-        fn=refresh_models,
-        outputs=[model_select]
-    )
-    # 页面加载时自动刷新模型列表和状态
+    refresh_btn.click(fn=refresh_models, outputs=[model_select])
     demo.load(
         fn=lambda: (check_llama_status(), refresh_models()),
         outputs=[status_box, model_select]
@@ -784,7 +765,6 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)") as demo:
     check_btn.click(fn=check_llama_status, outputs=[status_box])
     launch_toolbox_btn.click(fn=launch_format_converter, outputs=[status_box])
 
-    # 角色预设下拉事件
     def on_preset_change(role_id):
         if not role_id:
             return "你是一个乐于助人的助手，请用中文回答用户的问题。", gr.update(placeholder="请输入内容...")
@@ -831,5 +811,11 @@ if __name__ == "__main__":
     print("启动 轻舟 AI・无记忆聊天 (llama.cpp 后端)")
     print("请确保已运行 llama-server")
     print("=" * 60)
-    # 非阻塞启动，移除启动前的检查请求
-    demo.launch(server_name="127.0.0.1", server_port=7861, share=False, inbrowser=True, css=css)
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7861,
+        share=False,
+        inbrowser=True,
+        css=css,
+        favicon_path=str(ico_path) if ico_path.exists() else None
+    )
