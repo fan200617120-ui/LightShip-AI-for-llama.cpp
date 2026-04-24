@@ -3,7 +3,8 @@
 """
 轻舟 AI・LightShip AI - 无记忆聊天 (llama.cpp 后端)
 支持流式输出、思考过程、多模态图片、系统提示词、导出对话、一键唤起转换工具箱
-界面优化：右侧按钮垂直布局，状态栏与导出文件同行
+新增：外挂 JSON 角色预设，一键切换专业提示词
+修复：Chatbot 兼容性、非阻塞启动、流式解析器稳定性
 Copyright 2026 光影的故事2018
 """
 
@@ -94,7 +95,7 @@ def encode_image_to_base64(image_path):
         print(f"图片编码失败: {e}")
         return None
 
-# ==================== 流式解析器（含UTF-8清洗） ====================
+# ==================== 流式解析器（修复标签拆分、buffer 卡死） ====================
 class StreamResponseParser:
     def __init__(self):
         self.thought = ""
@@ -113,7 +114,11 @@ class StreamResponseParser:
 
     def parse_chunk(self, chunk_data: dict) -> dict:
         result = {"thought": "", "answer": "", "status": "answering"}
-        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+        # 修复索引越界 BUG
+        choices = chunk_data.get("choices", [])
+        if not choices:
+            return result
+        delta = choices[0].get("delta", {})
 
         reasoning = delta.get("reasoning_content", "")
         if reasoning:
@@ -127,7 +132,6 @@ class StreamResponseParser:
         content = delta.get("content", "")
         if not content:
             return result
-
         content = self._clean_text(content)
         self.char_count += len(content)
         self.buffer += content
@@ -147,20 +151,15 @@ class StreamResponseParser:
                     result["status"] = "thinking"
                     continue
                 else:
-                    if self.buffer.rstrip().endswith('<') or '<' in self.buffer[-5:]:
-                        last_lt = self.buffer.rfind('<')
-                        if last_lt != -1:
-                            safe_part = self.buffer[:last_lt]
-                            self.buffer = self.buffer[last_lt:]
-                            if safe_part:
-                                safe_part = self._clean_text(safe_part)
-                                self.answer += safe_part
-                                result["answer"] += safe_part
-                        else:
-                            clean_buf = self._clean_text(self.buffer)
-                            self.answer += clean_buf
-                            result["answer"] += clean_buf
-                            self.buffer = ""
+                    # 优化：仅保留不完整标签前缀，避免 buffer 卡死
+                    if self.buffer.endswith('<') or self.buffer.endswith('</t') or self.buffer.endswith('</th'):
+                        keep_len = min(6, len(self.buffer))
+                        safe_part = self.buffer[:-keep_len] if len(self.buffer) > keep_len else ""
+                        self.buffer = self.buffer[-keep_len:] if len(self.buffer) >= keep_len else self.buffer
+                        if safe_part:
+                            safe_part = self._clean_text(safe_part)
+                            self.answer += safe_part
+                            result["answer"] += safe_part
                     else:
                         clean_buf = self._clean_text(self.buffer)
                         self.answer += clean_buf
@@ -180,10 +179,12 @@ class StreamResponseParser:
                     result["status"] = "answering"
                     continue
                 else:
-                    clean_buf = self._clean_text(self.buffer)
-                    self.thought += clean_buf
-                    result["thought"] += clean_buf
-                    self.buffer = ""
+                    # 思考中，buffer 过长时强制输出，避免无内容
+                    if len(self.buffer) > 200:
+                        clean_buf = self._clean_text(self.buffer)
+                        self.thought += clean_buf
+                        result["thought"] += clean_buf
+                        self.buffer = ""
                     break
         return result
 
@@ -370,7 +371,7 @@ def clear_all():
 
 使用指南：
 1. 选择支持多模态的模型（如 qwen3.5 系列、gemma4 系列）以使用图片识别
-2. 可在右侧自定义系统提示词
+2. 可在右侧自定义系统提示词，或使用角色预设快速切换专业提示词
 3. 温度控制创意度，最大长度控制回复长度
 4. 对话支持思考过程显示
 5. 可随时停止生成
@@ -397,6 +398,44 @@ def refresh_models():
         return gr.Dropdown(choices=[("请先启动 llama-server", "none")], value="none")
     choices = get_model_display_list(models)
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
+
+# ==================== 外挂 JSON 角色预设 ====================
+def load_prompts():
+    """加载同目录下的 chat_prompts.json 文件"""
+    json_path = SCRIPT_DIR / "chat_prompts.json"
+    if not json_path.exists():
+        print(f"警告：未找到角色配置文件 {json_path}")
+        return {}
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data
+    except Exception as e:
+        print(f"加载角色配置失败: {e}")
+        return {}
+
+def get_prompt_options():
+    """从角色库生成下拉菜单选项列表 (显示名称, 角色ID)"""
+    prompts_data = load_prompts()
+    role_lib = prompts_data.get("角色库", {})
+    options = []
+    for category, roles in role_lib.items():
+        for role_id, role_info in roles.items():
+            display_name = f"{role_info['角色名称']} ({category})"
+            options.append((display_name, role_id))
+    return options
+
+def apply_preset(role_id):
+    """根据角色ID返回对应的系统提示词和输入占位符"""
+    prompts_data = load_prompts()
+    role_lib = prompts_data.get("角色库", {})
+    for category, roles in role_lib.items():
+        if role_id in roles:
+            info = roles[role_id]
+            system_prompt = info["系统提示词"]
+            placeholder = info.get("输入占位符", "请输入内容...")
+            return system_prompt, placeholder
+    return "", "请输入内容..."
 
 # ==================== 导出功能（借鉴 format_converter 增强机制） ====================
 PANDOC_PATH = SCRIPT_DIR.parent / "pandoc" / "pandoc.exe"
@@ -581,7 +620,7 @@ def is_format_converter_running(port):
         return False
 
 def launch_format_converter():
-    port = 7966
+    port = 7966   # 您的实际端口
     url = f"http://127.0.0.1:{port}"
     if is_format_converter_running(port):
         webbrowser.open(url)
@@ -606,10 +645,8 @@ def launch_format_converter():
 logo_path = SCRIPT_DIR / "ai_logo.png"
 ico_path = SCRIPT_DIR / "ai_logo.ico"
 
-initial_models = get_llama_models()
-if not initial_models:
-    initial_models = ["请先启动 llama-server"]
-model_choices = get_model_display_list(initial_models)
+# 移除阻塞式模型列表获取，改为页面加载后异步执行
+model_choices = []
 
 css = """
 .thoughts-details { border: 1px solid var(--border-color-primary); border-radius: 6px; padding: 10px; margin: 10px 0; background-color: var(--color-background-tertiary); }
@@ -617,7 +654,7 @@ css = """
 .thoughts-content { padding: 10px; background-color: var(--color-background-secondary); border-radius: 4px; font-style: italic; }
 """
 
-with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo:
+with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)") as demo:
     gr.Markdown("# 轻舟 AI・无记忆聊天 (llama.cpp)")
     gr.Markdown("###### 轻舟渡万境，一智载千寻。")
 
@@ -631,7 +668,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
 
 使用指南：
 1. 选择支持多模态的模型（如 qwen3.5 系列、gemma4 系列）以使用图片识别
-2. 可在右侧自定义系统提示词
+2. 可在右侧自定义系统提示词，或使用角色预设快速切换专业提示词
 3. 温度控制创意度，最大长度控制回复长度
 4. 对话支持思考过程显示
 5. 可随时停止生成
@@ -647,7 +684,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
                 with gr.Column(scale=3):
                     input_box = gr.Textbox(
                         label="输入文字",
-                        placeholder="请输入问题... (按回车发送)",
+                        placeholder="请输入内容...",
                         lines=14
                     )
                 with gr.Column(scale=1, min_width=150):
@@ -663,6 +700,15 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
 
         # 右侧：设置边栏
         with gr.Column(scale=1, min_width=280):
+            gr.Markdown("### 角色预设")
+            # 加载角色列表
+            preset_options = get_prompt_options()
+            role_dropdown = gr.Dropdown(
+                choices=preset_options,
+                label="选择一个专业角色",
+                value=None,
+                interactive=True
+            )
             gr.Markdown("### 系统提示词")
             system_prompt_box = gr.Textbox(
                 label="系统提示词",
@@ -674,7 +720,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
             gr.Markdown("### 模型设置")
             model_select = gr.Dropdown(
                 choices=model_choices,
-                value=model_choices[0][1] if model_choices else None,
+                value=None,
                 label="选择模型"
             )
             refresh_btn = gr.Button("🔄 刷新模型列表", size="sm")
@@ -711,7 +757,16 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
         export_file = gr.File(label="下载导出的文件", visible=True, height=50, scale=1)
 
     # 事件绑定
-    refresh_btn.click(fn=refresh_models, outputs=[model_select])
+    refresh_btn.click(
+        fn=refresh_models,
+        outputs=[model_select]
+    )
+    # 页面加载时自动刷新模型列表和状态
+    demo.load(
+        fn=lambda: (check_llama_status(), refresh_models()),
+        outputs=[status_box, model_select]
+    )
+
     send_btn.click(
         fn=stream_response_llama,
         inputs=[input_box, image_input, model_select, temp_slider, token_slider,
@@ -728,7 +783,19 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp)", css=css) as demo
     clear_btn.click(fn=clear_all, outputs=[history_box, status_box])
     check_btn.click(fn=check_llama_status, outputs=[status_box])
     launch_toolbox_btn.click(fn=launch_format_converter, outputs=[status_box])
-    demo.load(fn=check_llama_status, outputs=[status_box])
+
+    # 角色预设下拉事件
+    def on_preset_change(role_id):
+        if not role_id:
+            return "你是一个乐于助人的助手，请用中文回答用户的问题。", gr.update(placeholder="请输入内容...")
+        prompt, placeholder = apply_preset(role_id)
+        return prompt, gr.update(placeholder=placeholder)
+
+    role_dropdown.change(
+        fn=on_preset_change,
+        inputs=[role_dropdown],
+        outputs=[system_prompt_box, input_box]
+    )
 
     def handle_export(history, fmt):
         path, msg = export_full_chat(history, fmt)
@@ -764,6 +831,5 @@ if __name__ == "__main__":
     print("启动 轻舟 AI・无记忆聊天 (llama.cpp 后端)")
     print("请确保已运行 llama-server")
     print("=" * 60)
-    status = check_llama_status()
-    print(status)
-    demo.launch(server_name="127.0.0.1", server_port=7861, share=False, inbrowser=True)
+    # 非阻塞启动，移除启动前的检查请求
+    demo.launch(server_name="127.0.0.1", server_port=7861, share=False, inbrowser=True, css=css)
