@@ -1,0 +1,20 @@
+{
+  "presets": [
+    {
+      "name": "高速纯文本",
+      "temperature": 0.7,
+      "max_tokens": 2048,
+      "gpu_layers": 32,
+      "vision_mode": "禁用多模态",
+      "thinking_mode": false
+    },
+    {
+      "name": "多模态看图",
+      "temperature": 0.8,
+      "max_tokens": 4096,
+      "gpu_layers": 99,
+      "vision_mode": "自动（跟随 GPU 层数）",
+      "thinking_mode": true
+    }
+  ]
+}

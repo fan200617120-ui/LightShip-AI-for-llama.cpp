@@ -2,9 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 chat_llama.py - 基于 llama.cpp 后端的聊天助手（支持记忆、流式、思考过程、多模态）
-修复流式输出，恢复思考过程显示，支持 GPU 层数调整与对话导出
-新增：自定义系统提示词、多模态模式、界面布局优化
-增强：PDF 导出引擎检测、YAML 剥离容错、图片透明通道修复
 外挂 JSON：在线AI入口提示词模板动态加载
 Copyright 2026 光影的故事2018
 """
@@ -13,7 +10,6 @@ import sys
 import os
 SCRIPT_DIR = os.path.dirname(__file__)
 sys.path.insert(0, SCRIPT_DIR)
-
 import gradio as gr
 import requests
 import json
@@ -22,20 +18,19 @@ import re
 import base64
 import threading
 import webbrowser
-import imghdr
+from PIL import Image
 import tempfile
 import subprocess
 import shutil
-import socket
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from docx import Document
-from PIL import Image, ImageOps
 
-# ==================== 全局停止标志（基于会话） ====================
+# ==================== 全局停止标志与并发锁 ====================
 _stop_flags = {}
 _stop_lock = threading.Lock()
+_generating_locks = {}
+_generating_lock_dict_lock = threading.Lock()
 
 # ==================== llama.cpp 配置 ====================
 LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
@@ -78,7 +73,7 @@ def get_model_display_list(models):
     return display_list
 
 def is_multimodal(model_name: str) -> bool:
-    multimodal_keywords = ["qwen", "llava", "bakllava", "gemini", "cogvlm", "minicpm", "deepseek-vl", "gemma"]
+    multimodal_keywords = ["Qwen3","Qwen3.5", "qwen3.5","llava", "bakllava", "gemini", "cogvlm", "minicpm", "deepseek-vl","gemma4" , "gemma 4","Gemma 4 E4B"]
     return any(kw in model_name.lower() for kw in multimodal_keywords)
 
 # ==================== 记忆管理器 ====================
@@ -185,22 +180,66 @@ def get_prompt_text(role_id):
 def update_prompt(role_id):
     return get_prompt_text(role_id)
 
+def get_role_info(category, role_id):
+    """返回指定分类下角色的完整信息"""
+    prompts_data = load_prompts()
+    role_lib = prompts_data.get("角色库", {})
+    roles = role_lib.get(category, {})
+    return roles.get(role_id, {})
+
+def build_category_roles_map():
+    """构建 {分类名: [(角色ID, 角色显示名), ...]} 的映射"""
+    mapping = {}
+    prompts_data = load_prompts()
+    cat_list = prompts_data.get("分类目录", {})
+    role_lib = prompts_data.get("角色库", {})
+    for cat_name in cat_list.keys():
+        roles = role_lib.get(cat_name, {})
+        pairs = [(role_id, info["角色名称"]) for role_id, info in roles.items()]
+        mapping[cat_name] = pairs
+    return mapping
+
+# 生成静态变量供界面使用
+CATEGORY_ROLES_MAP = build_category_roles_map()
+CATEGORY_NAMES = list(CATEGORY_ROLES_MAP.keys())
+if CATEGORY_NAMES:
+    initial_category = CATEGORY_NAMES[0]
+    initial_roles = CATEGORY_ROLES_MAP[initial_category]
+    first_role_id = initial_roles[0][0] if initial_roles else ""
+    first_role_info = get_role_info(initial_category, first_role_id)
+else:
+    initial_category = ""
+    initial_roles = []
+    first_role_id = ""
+    first_role_info = {}
+
 def open_url(url):
     webbrowser.open(url)
     return f"已打开 {url}"
 
 def encode_image_to_base64(image_path):
     try:
-        img = Image.open(image_path)
-        img = ImageOps.exif_transpose(img)
-        img_format = 'jpeg'
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-            img.save(tmp.name, format='JPEG')
-            tmp_path = tmp.name
-        with open(tmp_path, "rb") as f:
+        # 直接尝试打开图片，PIL 自动校验文件合法性
+        with Image.open(image_path) as img:
+            img_format = img.format.lower() if img.format else None
+            if img_format == "jpg":
+                img_format = "jpeg"
+        
+        if img_format is None:
+            ext = os.path.splitext(image_path)[1].lower()
+            if ext in ['.jpg', '.jpeg']:
+                img_format = 'jpeg'
+            elif ext == '.png':
+                img_format = 'png'
+            elif ext == '.gif':
+                img_format = 'gif'
+            else:
+                img_format = 'jpeg'
+        
+        mime_type = f"image/{img_format}"
+        with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        os.unlink(tmp_path)
-        return f"data:image/{img_format};base64,{b64}"
+        return f"data:{mime_type};base64,{b64}"
     except Exception as e:
         print(f"图片编码失败: {e}")
         return None
@@ -214,9 +253,7 @@ def build_messages_with_memory(message, model_name, system_prompt, image_data_ur
         for mem in recent:
             system_content += f"用户：{mem['user']}\n助手：{mem['ai']}\n\n"
     system_content += f"今天是 {current_date}。请根据以上信息用中文回答。"
-
     messages = [{"role": "system", "content": system_content}]
-
     if image_data_url and is_multimodal(model_name):
         user_content = [
             {"type": "text", "text": message},
@@ -225,7 +262,6 @@ def build_messages_with_memory(message, model_name, system_prompt, image_data_ur
         messages.append({"role": "user", "content": user_content})
     else:
         messages.append({"role": "user", "content": message})
-
     return messages
 
 def format_thought_html(thought_text: str) -> str:
@@ -234,18 +270,11 @@ def format_thought_html(thought_text: str) -> str:
     clean = re.sub(r'<think>|</think>', '', thought_text).strip()
     if not clean:
         return ""
-    lines = clean.split('\n')
-    formatted_lines = []
-    for line in lines:
-        if line.strip():
-            formatted_lines.append(f"<em>{line}</em>")
-        else:
-            formatted_lines.append("<br>")
-    content = "<br>".join(formatted_lines)
+    clean_html = clean.replace('\n', '<br>')
     return f'''
-    <details class="thoughts-details">
-        <summary><strong>思考过程</strong> (点击展开/折叠)</summary>
-        <div class="thoughts-content">{content}</div>
+    <details>
+        <summary><strong>💭 思考过程</strong></summary>
+        <div style="font-style: italic;">{clean_html}</div>
     </details>
     '''
 
@@ -263,7 +292,6 @@ class StreamResponseParser:
     def parse_chunk(self, chunk_data: dict) -> dict:
         result = {"thought": "", "answer": "", "status": "answering"}
         delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-
         reasoning = delta.get("reasoning_content", "")
         if reasoning:
             self.thought += reasoning
@@ -271,14 +299,11 @@ class StreamResponseParser:
             result["thought"] = reasoning
             result["status"] = "thinking"
             return result
-
         content = delta.get("content", "")
         if not content:
             return result
-
         self.char_count += len(content)
         self.buffer += content
-
         while True:
             if not self.in_think_tag:
                 start_idx = self.buffer.find('<think>')
@@ -330,7 +355,7 @@ class StreamResponseParser:
 
     def finalize(self, usage=None):
         if self.buffer:
-            if self.in_think_tag:
+            if self.in_think_tag or self.has_think:
                 self.thought += self.buffer
             else:
                 self.answer += self.buffer
@@ -343,146 +368,151 @@ class StreamResponseParser:
             self.total_tokens = self.char_count // 2
         return self.answer, self.thought
 
-def stream_response(message, image_path, model_name, temperature, max_tokens, gpu_layers, system_prompt, vision_mode, history, request: gr.Request):
-    global _stop_flags, _stop_lock
-
-    available, status_msg = is_llama_available()
-    if not available:
-        error_content = f"{status_msg}，请先启动 llama-server 服务。"
-        updated_history = history + [{"role": "assistant", "content": error_content}]
-        yield updated_history, status_msg
-        return
-
-    if not model_name or model_name == "none":
-        error_content = "未选择有效的模型，请刷新模型列表后重试。"
-        updated_history = history + [{"role": "assistant", "content": error_content}]
-        yield updated_history, error_content
-        return
+def stream_response(message, image_path, model_name, temperature, max_tokens, gpu_layers,
+                    system_prompt, vision_mode, thinking_mode, history, request: gr.Request):
+    global _stop_flags, _generating_locks
 
     session_id = request.session_hash
-    with _stop_lock:
-        _stop_flags[session_id] = False
 
-    enable_vision = True
-    force_cpu_vision = False
-    if vision_mode == "禁用多模态":
-        enable_vision = False
-        image_path = None
-    elif vision_mode == "仅 CPU（节省显存）":
-        force_cpu_vision = True
-
-    image_data_url = None
-    if enable_vision and image_path is not None:
-        if is_multimodal(model_name):
-            image_data_url = encode_image_to_base64(image_path)
-            if not image_data_url:
-                image_path = None
-        else:
-            print(f"警告：模型 {model_name} 不支持图片，已忽略。")
-            image_path = None
-
-    messages = build_messages_with_memory(message, model_name, system_prompt, image_data_url)
-
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "stream": True,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if gpu_layers >= 0:
-        payload["n_gpu_layers"] = gpu_layers
-    if force_cpu_vision:
-        payload["mmproj_cpu"] = True
-
-    timestamp = time.strftime('%H:%M:%S')
-    user_content = f"[{timestamp}] 用户：{message}" + (" [附图片]" if image_path else "")
-    updated_history = history + [{"role": "user", "content": user_content}]
-    updated_history.append({"role": "assistant", "content": f"[{timestamp}] {model_name}："})
-
-    gpu_info = f"(GPU层数: {gpu_layers})" if gpu_layers >= 0 else "(GPU层数: 服务器默认)"
-    yield updated_history, f"模型 [{model_name}] 正在生成... {gpu_info}"
-
-    parser = StreamResponseParser()
-    full_answer = ""
-    full_thought = ""
+    # 并发控制：同一会话同时只允许一个生成任务
+    with _generating_lock_dict_lock:
+        if session_id not in _generating_locks:
+            _generating_locks[session_id] = threading.Lock()
+        lock = _generating_locks[session_id]
+    if not lock.acquire(blocking=False):
+        updated_history = history + [{"role": "assistant",
+                                      "content": "⏳ 上一个生成任务仍在进行，请稍后或点击「停止对话」再试。"}]
+        yield updated_history, "生成任务进行中"
+        return
 
     try:
-        response = requests.post(LLAMA_API_URL, json=payload, stream=True, timeout=180)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-
-        for line in response.iter_lines(decode_unicode=True):
-            with _stop_lock:
-                if _stop_flags.get(session_id, False):
-                    updated_history[-1]["content"] = f"[{timestamp}] {model_name}：{full_answer}\n\n[已手动停止]"
-                    yield updated_history, "生成已停止"
-                    return
-
-            if line:
-                line = line.strip()
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data_str)
-                        parsed = parser.parse_chunk(chunk)
-
-                        if parsed["thought"]:
-                            full_thought += parsed["thought"]
-                        if parsed["answer"]:
-                            full_answer += parsed["answer"]
-
-                        display = f"[{timestamp}] {model_name}："
-                        if full_thought:
-                            display += f"\n\n{full_thought}\n\n"
-                        if full_answer:
-                            display += full_answer
-                        else:
-                            display += "█"
-
-                        updated_history[-1]["content"] = display
-                        yield updated_history, f"生成中... ({len(full_answer)} 字符)"
-
-                        if "usage" in chunk:
-                            parser.total_tokens = chunk["usage"].get("completion_tokens", 0)
-                    except json.JSONDecodeError:
-                        continue
-
-        final_answer, final_thought = parser.finalize()
-        total_tokens = parser.total_tokens if parser.total_tokens > 0 else parser.char_count // 2
-        duration = time.time() - parser.start_time
-        speed = total_tokens / duration if duration > 0 else 0
-        stat_str = f"{total_tokens} tokens, {duration:.1f}s, {speed:.2f}t/s"
-
-        thought_html = format_thought_html(final_thought) if final_thought else ""
-
-        final_content = f"""
-<div style="margin-bottom: 10px;">
-    <strong>[{timestamp}] {model_name}：</strong>
-</div>
-{thought_html}
-
-{final_answer}
-
-<div style="margin-top: 15px; color: #888; font-size: 0.85em;">
-    [统计] {stat_str} {gpu_info}
-</div>
-"""
-        updated_history[-1]["content"] = final_content
-        memory_manager.add_memory(message, final_answer)
-        yield updated_history, f"生成完成，{stat_str}"
-
-    except requests.exceptions.ConnectionError:
-        updated_history[-1]["content"] = f"[{timestamp}] {model_name}：连接失败，请确保已运行 llama-server"
-        yield updated_history, "连接失败"
-    except Exception as e:
-        updated_history[-1]["content"] = f"[{timestamp}] {model_name}：错误：{str(e)}"
-        yield updated_history, f"错误：{str(e)}"
-    finally:
+        available, status_msg = is_llama_available()
+        if not available:
+            error_content = f"{status_msg}，请先启动 llama-server 服务。"
+            updated_history = history + [{"role": "assistant", "content": error_content}]
+            yield updated_history, status_msg
+            return
+        if not model_name or model_name == "none":
+            error_content = "未选择有效的模型，请刷新模型列表后重试。"
+            updated_history = history + [{"role": "assistant", "content": error_content}]
+            yield updated_history, error_content
+            return
         with _stop_lock:
-            _stop_flags.pop(session_id, None)
+            _stop_flags[session_id] = False
+        enable_vision = True
+        force_cpu_vision = False
+        if vision_mode == "禁用多模态":
+            enable_vision = False
+            image_path = None
+        elif vision_mode == "仅 CPU（节省显存）":
+            force_cpu_vision = True
+        image_data_url = None
+        if enable_vision and image_path is not None:
+            if is_multimodal(model_name):
+                image_data_url = encode_image_to_base64(image_path)
+                if not image_data_url:
+                    image_path = None
+            else:
+                print(f"警告：模型 {model_name} 不支持图片，已忽略。")
+                image_path = None
+        messages = build_messages_with_memory(message, model_name, system_prompt, image_data_url)
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "stream": True,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if gpu_layers >= 0:
+            payload["n_gpu_layers"] = gpu_layers
+        if force_cpu_vision:
+            payload["mmproj_cpu"] = True
+
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking_mode}
+        payload["extra_body"] = {
+            "override_kv": {
+                "llama.enable_thinking": thinking_mode
+            }
+        }
+
+        timestamp = time.strftime('%H:%M:%S')
+        
+        user_content = f"[{timestamp}] 用户：{message}" + (" [附图片]" if image_path else "")
+        updated_history = history + [{"role": "user", "content": user_content}]
+        updated_history.append({"role": "assistant", "content": f"[{timestamp}] {model_name}："})
+        gpu_info = f"(GPU层数: {gpu_layers})" if gpu_layers >= 0 else "(GPU层数: 服务器默认)"
+        yield updated_history, f"模型 [{model_name}] 正在生成... {gpu_info}"
+        parser = StreamResponseParser()
+        full_answer = ""
+        full_thought = ""
+        try:
+            response = requests.post(LLAMA_API_URL, json=payload, stream=True, timeout=180)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            for line in response.iter_lines(decode_unicode=True):
+                with _stop_lock:
+                    if _stop_flags.get(session_id, False):
+                        updated_history[-1]["content"] = f"[{timestamp}] {model_name}：{full_answer}\n\n[已手动停止]"
+                        yield updated_history, "生成已停止"
+                        return
+                if line:
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(data_str)
+                            parsed = parser.parse_chunk(chunk)
+                            if parsed["thought"]:
+                                full_thought += parsed["thought"]
+                            if parsed["answer"]:
+                                full_answer += parsed["answer"]
+                            display = f"[{timestamp}] {model_name}："
+                            thought_formatted = format_thoughts_streaming(full_thought)
+                            if thought_formatted:
+                                display += f"\n\n{thought_formatted}\n\n"
+                            if full_answer:
+                                display += full_answer
+                            else:
+                                display += "█"
+                            updated_history[-1]["content"] = display
+                            yield updated_history, f"生成中... ({len(full_answer)} 字符)"
+                            if "usage" in chunk:
+                                parser.total_tokens = chunk["usage"].get("completion_tokens", 0)
+                        except json.JSONDecodeError:
+                            continue
+
+            final_answer, final_thought = parser.finalize()
+            total_tokens = parser.total_tokens if parser.total_tokens > 0 else parser.char_count // 2
+            duration = time.time() - parser.start_time
+            speed = total_tokens / duration if duration > 0 else 0
+            stat_str = f"{total_tokens} tokens, {duration:.1f}s, {speed:.2f}t/s"
+            thought_html = format_thoughts_collapsible(final_thought) if final_thought else ""
+            final_content = f"""
+    <div style="margin-bottom: 10px;">
+        <strong>[{timestamp}] {model_name}：</strong>
+    </div>
+    {thought_html}
+    {final_answer}
+    <div style="margin-top: 15px; color: #888; font-size: 0.85em;">
+        [统计] {stat_str} {gpu_info}
+    </div>
+    """
+            updated_history[-1]["content"] = final_content
+            memory_manager.add_memory(message, final_answer)
+            yield updated_history, f"生成完成，{stat_str}"
+        except requests.exceptions.ConnectionError:
+            updated_history[-1]["content"] = f"[{timestamp}] {model_name}：连接失败，请确保已运行 llama-server"
+            yield updated_history, "连接失败"
+        except Exception as e:
+            updated_history[-1]["content"] = f"[{timestamp}] {model_name}：错误：{str(e)}"
+            yield updated_history, f"错误：{str(e)}"
+        finally:
+            with _stop_lock:
+                _stop_flags.pop(session_id, None)
+    finally:
+        lock.release()
 
 def stop_generation(request: gr.Request):
     session_id = request.session_hash
@@ -526,7 +556,139 @@ def refresh_models():
     choices = get_model_display_list(models)
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
-# ==================== 转换工具配置 ====================
+# ==================== 参数预设管理（外挂 JSON） ====================
+PRESETS_FILE = Path(SCRIPT_DIR) / "presets.json"
+
+def load_presets():
+    if PRESETS_FILE.exists():
+        try:
+            with open(PRESETS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get("presets", [])
+        except:
+            pass
+    return []
+
+def save_presets_to_file(presets):
+    with open(PRESETS_FILE, 'w', encoding='utf-8') as f:
+        json.dump({"presets": presets}, f, ensure_ascii=False, indent=2)
+
+def get_preset_choices():
+    presets = load_presets()
+    return [(p["name"], p["name"]) for p in presets]
+
+def on_preset_select(name):
+    presets = load_presets()
+    for p in presets:
+        if p["name"] == name:
+            return (
+                p["temperature"],
+                p["max_tokens"],
+                p["gpu_layers"],
+                p.get("vision_mode", "自动（跟随 GPU 层数）"),
+                p.get("thinking_mode", True)
+            )
+    return 0.7, 2048, -1, "自动（跟随 GPU 层数）", True
+
+def save_current_preset(name, temp, tokens, gpu, vision, thinking):
+    if not name or not name.strip():
+        return gr.Dropdown(choices=get_preset_choices(), value=None)
+    name = name.strip()
+    presets = load_presets()
+    for p in presets:
+        if p["name"] == name:
+            p["temperature"] = temp
+            p["max_tokens"] = tokens
+            p["gpu_layers"] = gpu
+            p["vision_mode"] = vision
+            p["thinking_mode"] = thinking
+            break
+    else:
+        presets.append({
+            "name": name,
+            "temperature": temp,
+            "max_tokens": tokens,
+            "gpu_layers": gpu,
+            "vision_mode": vision,
+            "thinking_mode": thinking
+        })
+    save_presets_to_file(presets)
+    choices = get_preset_choices()
+    return gr.Dropdown(choices=choices, value=name)
+
+def delete_preset(name):
+    presets = load_presets()
+    presets = [p for p in presets if p["name"] != name]
+    save_presets_to_file(presets)
+    choices = get_preset_choices()
+    return gr.Dropdown(choices=choices, value=None)
+
+def export_presets():
+    if PRESETS_FILE.exists():
+        return gr.File(value=str(PRESETS_FILE), visible=True)
+    return gr.File(value=None, visible=False)
+
+def import_presets(file):
+    if file is None:
+        return gr.Dropdown()
+    try:
+        with open(file.name, 'r', encoding='utf-8') as f:
+            new_data = json.load(f)
+        new_presets = new_data.get("presets", [])
+        current = load_presets()
+        name_map = {p["name"]: p for p in current}
+        for p in new_presets:
+            name_map[p["name"]] = p
+        save_presets_to_file(list(name_map.values()))
+    except Exception as e:
+        print(f"导入失败: {e}")
+    return gr.Dropdown(choices=get_preset_choices(), value=None)
+
+def format_thoughts_streaming(thoughts: str) -> str:
+    """流式输出时，给思考文字加上标题和分点样式"""
+    if not thoughts:
+        return ""
+    thought_content = re.sub(r'<think>|</think>', '', thoughts).strip()
+    if not thought_content:
+        return ""
+    lines = thought_content.split('\n')
+    formatted = "<strong>💭 思考过程：</strong><br><br>"
+    for line in lines:
+        line = line.strip()
+        if line:
+            # 引导句用强调样式
+            if re.match(r'^(首先|第一|1\.|其次|第二|然后|最后|第三|最终|总结|所以|因此)', line):
+                formatted += f"<em>🔹 {line}</em><br>"
+            else:
+                formatted += f"<em>• {line}</em><br>"
+    return formatted
+
+def format_thoughts_collapsible(thoughts: str) -> str:
+    """生成结束后，把思考过程放入折叠块，保留层级结构"""
+    if not thoughts:
+        return ""
+    thought_content = re.sub(r'<think>|</think>', '', thoughts).strip()
+    if not thought_content:
+        return ""
+    lines = thought_content.split('\n')
+    italic_lines = []
+    for line in lines:
+        if line.strip():
+            if re.match(r'^(首先|第一|1\.|其次|第二|然后|最后|第三|最终|总结|所以|因此)', line):
+                italic_lines.append(f"🔹 {line}")
+            else:
+                italic_lines.append(f"• {line}")
+        else:
+            italic_lines.append("<br>")
+    content_html = "<br>".join(italic_lines)
+    return f'''<details>
+        <summary><strong>💭 思考过程</strong>（点击展开/折叠）</summary>
+        <div style="font-style: italic; padding-left: 1em; margin-top: 0.5em;">
+            {content_html}
+        </div>
+    </details>'''
+
+# ==================== 转换工具配置（仅用于文档导出，不启动独立工具箱） ====================
 PANDOC_PATH = Path(SCRIPT_DIR).parent / "pandoc" / "pandoc.exe"
 OUTPUT_DIR = Path(SCRIPT_DIR).parent / "output"
 IMAGE_OUTPUT_DIR = OUTPUT_DIR / "images"
@@ -597,7 +759,6 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
     tgt_ext = SUPPORTED_FORMATS.get(tgt_format, "")
     reader = FORMAT_ALIASES.get(src_ext, src_ext)
     writer = FORMAT_ALIASES.get(tgt_ext, tgt_ext)
-
     pdf_engine = None
     if tgt_ext == ".pdf":
         for eng in ["xelatex", "pdflatex", "lualatex"]:
@@ -609,7 +770,6 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
                 continue
         if pdf_engine is None:
             return "未找到 LaTeX 引擎，无法生成 PDF（可先导出为 HTML 再打印）。"
-
     extra_args = []
     if tgt_ext == ".pdf":
         extra_args.extend(["--pdf-engine", pdf_engine])
@@ -619,8 +779,15 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
     elif tgt_ext == ".docx":
         if enable_toc:
             extra_args.append("--toc")
-        if reference_doc and os.path.exists(reference_doc):
-            extra_args.extend(["--reference-doc", reference_doc])
+        # 安全获取 reference_doc 的路径
+        if reference_doc is not None:
+            ref_path = None
+            if isinstance(reference_doc, str):
+                ref_path = reference_doc
+            elif hasattr(reference_doc, 'name'):
+                ref_path = reference_doc.name
+            if ref_path and os.path.exists(ref_path):
+                extra_args.extend(["--reference-doc", ref_path])
 
     succ, fail = 0, []
     for file_obj in files:
@@ -631,7 +798,6 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
         while out_path.exists():
             out_path = OUTPUT_DIR / f"{in_name.stem}_{counter}{tgt_ext}"
             counter += 1
-
         success_flag = False
         error_msg = ""
         readers_to_try = [reader]
@@ -664,12 +830,10 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
                         pass
                 if success_flag:
                     break
-
         if success_flag:
             succ += 1
         else:
             fail.append(in_name.name)
-
     msg = f"成功 {succ} 个"
     if fail:
         msg += f"，失败 {len(fail)} 个"
@@ -691,6 +855,8 @@ def convert_images_func(files, target_format, quality):
             counter += 1
         try:
             img = Image.open(in_path)
+            # 自动旋转
+            from PIL import ImageOps
             img = ImageOps.exif_transpose(img)
             if target_format in ["JPEG", "WebP"]:
                 if img.mode in ("RGBA", "LA", "P") and target_format == "JPEG":
@@ -785,7 +951,6 @@ def export_chat_to_format(markdown_text, target_format):
     writer = FORMAT_ALIASES.get(tgt_ext, "docx")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}{tgt_ext}"
-
     pdf_engine = None
     if target_format == "PDF":
         for eng in ["xelatex", "pdflatex", "lualatex"]:
@@ -800,7 +965,6 @@ def export_chat_to_format(markdown_text, target_format):
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(markdown_text)
             return str(txt_path), "没有找到 LaTeX 引擎，已降级保存为纯文本。"
-
     def run_pandoc(md_text, reader):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
             f.write(md_text)
@@ -819,7 +983,6 @@ def export_chat_to_format(markdown_text, target_format):
             return False, e.stderr
         finally:
             os.unlink(temp_md)
-
     readers = ["markdown+hard_line_breaks-yaml_metadata_block", "markdown+hard_line_breaks"]
     success = False
     last_error = ""
@@ -837,10 +1000,8 @@ def export_chat_to_format(markdown_text, target_format):
                     success = True
                     break
                 last_error = err2
-
     if success:
         return str(output_path), f"导出成功：{output_path.name}"
-
     try:
         txt_path = CHAT_EXPORT_DIR / f"chat_export_{timestamp}.txt"
         with open(txt_path, 'w', encoding='utf-8') as f:
@@ -867,44 +1028,6 @@ def export_full_chat(history, target_format):
         return None, "无有效对话内容。"
     full_md = "".join(lines)
     return export_chat_to_format(full_md, target_format)
-
-# ==================== 一键启动转换工具箱 ====================
-def is_port_open(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.connect(("127.0.0.1", port))
-            return True
-        except:
-            return False
-
-def is_format_converter_running(port):
-    try:
-        r = requests.get(f"http://127.0.0.1:{port}", timeout=1)
-        return r.status_code == 200 and "轻舟 AI 工具箱" in r.text
-    except:
-        return False
-
-def launch_format_converter():
-    port = 7966
-    url = f"http://127.0.0.1:{port}"
-    if is_format_converter_running(port):
-        webbrowser.open(url)
-        return f"转换工具箱已在运行，浏览器已打开 {url}"
-    script_path = Path(SCRIPT_DIR).parent / "pandoc" / "format_converter.py"
-    if not script_path.exists():
-        return f"❌ 未找到转换器脚本：{script_path}"
-    try:
-        subprocess.Popen(
-            [sys.executable, str(script_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        )
-        time.sleep(2)
-        webbrowser.open(url)
-        return f"✅ 转换工具箱已启动，浏览器已打开 {url}"
-    except Exception as e:
-        return f"❌ 启动失败：{str(e)}"
 
 # ==================== Gradio 界面 ====================
 logo_path = os.path.join(SCRIPT_DIR, "ai_logo.png")
@@ -938,7 +1061,7 @@ css = """
 }
 """
 
-with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
+with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
     with gr.Row():
         if os.path.exists(logo_path):
             gr.Image(logo_path, height=50, show_label=False, container=False, scale=0)
@@ -1012,8 +1135,31 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
                         label="GPU 层数 (-1=默认, 0=纯CPU, 99=全GPU)",
                         info="需 llama-server 支持请求级设置"
                     )
+                    
+                    # 折叠面板：参数预设
+                    with gr.Accordion("⚙️ 参数预设", open=False):
+                        preset_dropdown = gr.Dropdown(
+                            choices=get_preset_choices(),
+                            label="选择预设",
+                            value=None,
+                            interactive=True
+                        )
+                        with gr.Row():
+                            preset_name_box = gr.Textbox(label="预设名称", placeholder="例如：高速推理")
+                            save_preset_btn = gr.Button("📁 保存当前设置", size="sm")
+                            delete_preset_btn = gr.Button("🗑 删除预设", size="sm")
+                        with gr.Row():
+                            export_presets_btn = gr.Button("⬇️ 导出预设", size="sm")
+                            import_presets_btn = gr.UploadButton("⬆️ 导入预设", file_types=[".json"], size="sm")
+                            export_file = gr.File(visible=False)  # 用于导出                    
+                    
                     gr.Markdown("---")
-                    gr.Markdown("### 多模态设置")
+                    thinking_mode_cb = gr.Checkbox(
+                        label="开启思考过程（仅深度推理模型生效）",
+                        value=True,
+                        info="关闭后强制禁用  标签，模型直接输出答案"
+                    )
+                    gr.Markdown("### 多模态设置")             
                     vision_mode = gr.Dropdown(
                         choices=["自动（跟随 GPU 层数）", "仅 CPU（节省显存）", "禁用多模态"],
                         value="自动（跟随 GPU 层数）",
@@ -1029,46 +1175,62 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
                     gr.Markdown("---")
                     check_btn = gr.Button("检查服务", variant="secondary")
                     clear_btn = gr.Button("清空对话", variant="secondary")
-                    gr.Markdown("---")
-                    launch_toolbox_btn = gr.Button("🧰 打开转换工具箱", variant="secondary")
 
             with gr.Row():
-                status_box = gr.Textbox(label="状态", value="就绪", interactive=False, scale=4)
-                export_file = gr.File(label="下载导出的文件", visible=True, height=50, scale=1)
+                status_box = gr.Textbox(label="状态", value="就绪", interactive=False, lines=3)
 
             refresh_btn.click(fn=refresh_models, outputs=[model_select])
             send_btn.click(
                 fn=stream_response,
-                inputs=[input_box, image_input, model_select, temp_slider, token_slider, gpu_layers_slider, system_prompt_box, vision_mode, history_box],
+                inputs=[input_box, image_input, model_select, temp_slider, token_slider,
+                        gpu_layers_slider, system_prompt_box, vision_mode, thinking_mode_cb, history_box],
                 outputs=[history_box, status_box]
             ).then(lambda: ("", None), None, [input_box, image_input])
             input_box.submit(
                 fn=stream_response,
-                inputs=[input_box, image_input, model_select, temp_slider, token_slider, gpu_layers_slider, system_prompt_box, vision_mode, history_box],
+                inputs=[input_box, image_input, model_select, temp_slider, token_slider,
+                        gpu_layers_slider, system_prompt_box, vision_mode, thinking_mode_cb, history_box],
                 outputs=[history_box, status_box]
             ).then(lambda: ("", None), None, [input_box, image_input])
             stop_btn.click(fn=stop_generation, outputs=[status_box])
             clear_btn.click(fn=clear_all, outputs=[history_box, status_box])
             check_btn.click(fn=check_llama_status, outputs=[status_box])
-            launch_toolbox_btn.click(fn=launch_format_converter, outputs=[status_box])
             demo.load(fn=check_llama_status, outputs=[status_box])
 
             def handle_chat_export(history, fmt):
                 path, msg = export_full_chat(history, fmt)
                 if path:
-                    return gr.update(value=path, visible=True), msg
-                else:
-                    return gr.update(visible=False), msg
+                    return f"{msg}\n文件已保存至：{path}"
+                return msg
 
             export_btn.click(
                 fn=handle_chat_export,
                 inputs=[history_box, export_format],
-                outputs=[export_file, status_box]
+                outputs=[status_box]
             )
             open_export_dir_btn.click(
                 fn=open_chat_export_dir,
                 outputs=[status_box]
             )
+            
+            # 参数预设事件绑定
+            preset_dropdown.change(
+                fn=on_preset_select,
+                inputs=[preset_dropdown],
+                outputs=[temp_slider, token_slider, gpu_layers_slider, vision_mode, thinking_mode_cb]
+            )
+            save_preset_btn.click(
+                fn=save_current_preset,
+                inputs=[preset_name_box, temp_slider, token_slider, gpu_layers_slider, vision_mode, thinking_mode_cb],
+                outputs=[preset_dropdown]
+            )
+            delete_preset_btn.click(
+                fn=delete_preset,
+                inputs=[preset_dropdown],
+                outputs=[preset_dropdown]
+            )
+            export_presets_btn.click(fn=export_presets, outputs=[export_file])
+            import_presets_btn.upload(fn=import_presets, inputs=[import_presets_btn], outputs=[preset_dropdown])
 
         # ==================== Tab2: 转换工具 ====================
         with gr.Tab("转换工具"):
@@ -1083,6 +1245,8 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
                                 lines=15,
                                 placeholder="点击上方按钮提取聊天记录，或直接粘贴 Markdown 文本"
                             )
+                            with gr.Accordion("格式预览", open=False):
+                                preview_md = gr.Markdown(value="*预览将在这里显示...*")
                             target_export_format = gr.Dropdown(
                                 choices=["Microsoft Word (docx)", "PDF", "HTML", "Plain Text", "Markdown"],
                                 label="导出格式",
@@ -1095,30 +1259,33 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
                             export_status = gr.Textbox(label="导出状态", interactive=False, lines=3)
                             export_file_download = gr.File(label="下载导出的文件", visible=True)
 
+                    markdown_input.change(
+                        fn=lambda txt: txt if txt.strip() else "*内容为空*",
+                        inputs=[markdown_input],
+                        outputs=[preview_md]
+                    )
+
                     extract_btn.click(
                         fn=get_last_assistant_markdown,
                         inputs=[history_box],
                         outputs=[markdown_input]
                     )
 
-                    def handle_export(md_text, fmt):
+                    def handle_export_md(md_text, fmt):
                         if not md_text.strip():
-                            return None, "请先提取或输入 Markdown 内容。"
+                            return gr.File(value=None, visible=False), "请先提取或输入 Markdown 内容。"
                         path, msg = export_chat_to_format(md_text, fmt)
                         if path:
-                            return gr.update(value=path, visible=True), msg
+                            return gr.File(value=path, visible=True), msg
                         else:
-                            return gr.update(visible=False), msg
+                            return gr.File(value=None, visible=False), msg
 
                     export_md_btn.click(
-                        fn=handle_export,
+                        fn=handle_export_md,
                         inputs=[markdown_input, target_export_format],
                         outputs=[export_file_download, export_status]
                     )
-                    open_md_dir_btn.click(
-                        fn=open_chat_export_dir,
-                        outputs=[export_status]
-                    )
+                    open_md_dir_btn.click(fn=open_chat_export_dir, outputs=[export_status])
 
                 with gr.Tab("文档格式转换"):
                     status_doc = gr.Textbox(label="Pandoc 状态", value=check_pandoc(), interactive=False)
@@ -1166,47 +1333,99 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
                     rename_btn.click(fn=batch_copy_rename, inputs=[rename_files, new_extension], outputs=[rename_result])
                     rename_open_folder_btn.click(fn=open_rename_folder, outputs=[rename_result])
 
-        # ==================== Tab3: 在线AI入口 ====================
+        # ---------- Tab3: 在线AI入口（动态模板） ----------
         with gr.Tab("在线AI入口"):
-            with gr.Column():
-                gr.Markdown("### 快速入口")
-                with gr.Row(equal_height=True):
-                    btn_deepl = gr.Button("DeepL", variant="secondary")
-                    btn_youdao = gr.Button("有道翻译", variant="secondary")
-                    btn_deepseek = gr.Button("DeepSeek", variant="secondary")
-                    btn_doubao = gr.Button("豆包", variant="secondary")
-                with gr.Row(equal_height=True):
-                    btn_qianwen = gr.Button("通义千问", variant="secondary")
-                    btn_kimi = gr.Button("Kimi", variant="secondary")
-                    btn_chatglm = gr.Button("ChatGLM", variant="secondary")
-                    btn_yuanbao = gr.Button("腾讯元宝", variant="secondary")
-                status_trans = gr.Textbox(label="", value="等待操作...", interactive=False)
+            gr.Markdown("### 快速入口")
+            with gr.Row(equal_height=True):
+                btn_deepl = gr.Button("DeepL", variant="secondary")
+                btn_youdao = gr.Button("有道翻译", variant="secondary")
+                btn_deepseek = gr.Button("DeepSeek", variant="secondary")
+                btn_doubao = gr.Button("豆包", variant="secondary")
+            with gr.Row(equal_height=True):
+                btn_qianwen = gr.Button("通义千问", variant="secondary")
+                btn_kimi = gr.Button("Kimi", variant="secondary")
+                btn_chatglm = gr.Button("ChatGLM", variant="secondary")
+                btn_yuanbao = gr.Button("腾讯元宝", variant="secondary")
+            status_trans = gr.Textbox(label="", value="点击按钮打开对应网站", interactive=False)
 
-                gr.Markdown("---")
-                gr.Markdown("### 提示词模板")
-                prompt_options = get_prompt_options()
-                prompt_selector = gr.Dropdown(
-                    label="选择提示词类型",
-                    choices=prompt_options,
-                    value=prompt_options[0][1] if prompt_options else None,
-                )
-                prompt_display = gr.Textbox(
-                    label="提示词内容 (可直接编辑)",
-                    value=get_prompt_text(prompt_options[0][1]) if prompt_options else "",
-                    lines=10,
-                    interactive=True,
-                )
-                gr.Markdown("使用方法：选择模板 → 复制提示词 → 点击上方按钮打开网站 → 粘贴使用。")
+            gr.Markdown("---")
+            gr.Markdown("### 智能提示词模板（动态加载）")
 
-                btn_deepl.click(fn=lambda: open_url(URLS["DeepL"]), outputs=status_trans)
-                btn_youdao.click(fn=lambda: open_url(URLS["有道翻译"]), outputs=status_trans)
-                btn_deepseek.click(fn=lambda: open_url(URLS["DeepSeek"]), outputs=status_trans)
-                btn_doubao.click(fn=lambda: open_url(URLS["豆包"]), outputs=status_trans)
-                btn_qianwen.click(fn=lambda: open_url(URLS["通义千问"]), outputs=status_trans)
-                btn_kimi.click(fn=lambda: open_url(URLS["Kimi"]), outputs=status_trans)
-                btn_chatglm.click(fn=lambda: open_url(URLS["ChatGLM"]), outputs=status_trans)
-                btn_yuanbao.click(fn=lambda: open_url(URLS["腾讯元宝"]), outputs=status_trans)
-                prompt_selector.change(fn=update_prompt, inputs=[prompt_selector], outputs=[prompt_display])
+            # 分类选择
+            with gr.Row():
+                category_dd = gr.Dropdown(
+                    label="选择分类",
+                    choices=CATEGORY_NAMES,
+                    value=initial_category,
+                    interactive=True
+                )
+                role_dd = gr.Dropdown(
+                    label="选择角色",
+                    choices=[(name, role_id) for (role_id, name) in initial_roles] if initial_roles else [],
+                    value=first_role_id,
+                    interactive=True
+                )
+
+            # 当前角色的提示词与占位符
+            current_prompt = gr.Textbox(
+                label="系统提示词",
+                value=first_role_info.get("系统提示词", ""),
+                lines=8,
+                interactive=True
+            )
+            placeholder_box = gr.Textbox(
+                label="输入占位符（可复制到需要输入的地方）",
+                value=first_role_info.get("输入占位符", ""),
+                interactive=False
+            )
+
+            gr.Markdown("使用方法：选择分类和角色 → 复制提示词/占位符 → 点击上方按钮打开 AI 网站 → 粘贴使用。")
+
+            # 联动更新角色列表（使用 gr.update 修复）
+            def on_category_change(cat):
+                roles = CATEGORY_ROLES_MAP.get(cat, [])
+                if roles:
+                    choices = [(name, role_id) for (role_id, name) in roles]
+                    default_role = roles[0][0]
+                    return (
+                        gr.Dropdown(choices=choices, value=default_role),
+                        gr.Textbox(value=""),
+                        gr.Textbox(value="")
+                    )
+                else:
+                    return (
+                        gr.Dropdown(choices=[], value=None),
+                        gr.Textbox(value=""),
+                        gr.Textbox(value="")
+                    )
+
+            def on_role_change(cat, role):
+                info = get_role_info(cat, role)
+                return (
+                    gr.Textbox(value=info.get("系统提示词", "")),
+                    gr.Textbox(value=info.get("输入占位符", ""))
+                )
+
+            category_dd.change(
+                fn=on_category_change,
+                inputs=[category_dd],
+                outputs=[role_dd, current_prompt, placeholder_box]
+            )
+            role_dd.change(
+                fn=on_role_change,
+                inputs=[category_dd, role_dd],
+                outputs=[current_prompt, placeholder_box]
+            )
+
+            # 网站按钮绑定
+            btn_deepl.click(fn=lambda: open_url(URLS["DeepL"]), outputs=status_trans)
+            btn_youdao.click(fn=lambda: open_url(URLS["有道翻译"]), outputs=status_trans)
+            btn_deepseek.click(fn=lambda: open_url(URLS["DeepSeek"]), outputs=status_trans)
+            btn_doubao.click(fn=lambda: open_url(URLS["豆包"]), outputs=status_trans)
+            btn_qianwen.click(fn=lambda: open_url(URLS["通义千问"]), outputs=status_trans)
+            btn_kimi.click(fn=lambda: open_url(URLS["Kimi"]), outputs=status_trans)
+            btn_chatglm.click(fn=lambda: open_url(URLS["ChatGLM"]), outputs=status_trans)
+            btn_yuanbao.click(fn=lambda: open_url(URLS["腾讯元宝"]), outputs=status_trans)
 
     gr.Markdown("---")
     gr.HTML("""
@@ -1243,6 +1462,7 @@ if __name__ == "__main__":
                 share=False,
                 inbrowser=True,
                 theme=gr.themes.Default(),
+                css=css,
                 favicon_path=ico_path if os.path.exists(ico_path) else None
             )
             break
