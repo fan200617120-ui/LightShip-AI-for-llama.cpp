@@ -37,6 +37,7 @@ from llama_params_controller import (
     export_presets,
     import_presets,
 )
+from llama_server_manager import restart_server   # 新增
 
 # ==================== 全局配置 ====================
 LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
@@ -48,7 +49,9 @@ _generating_locks = {}
 _generating_lock_dict_lock = threading.Lock()
 
 # 路径
-PANDOC_PATH = SCRIPT_DIR.parent / "pandoc" / "pandoc.exe"
+import platform
+_pandoc_name = "pandoc.exe" if platform.system() == "Windows" else "pandoc"
+PANDOC_PATH = SCRIPT_DIR.parent / "pandoc" / _pandoc_name
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
 CHAT_EXPORT_DIR = OUTPUT_DIR / "chat_exports"
 IMAGE_OUTPUT_DIR = OUTPUT_DIR / "images"
@@ -58,9 +61,12 @@ RENAME_OUTPUT_DIR = OUTPUT_DIR / "renamed"
 def is_llama_available():
     try:
         resp = requests.get(MODELS_URL, timeout=3)
-        if resp.status_code == 200: return True, "服务正常"
-        else: return False, f"服务异常，状态码：{resp.status_code}"
-    except Exception as e: return False, f"连接失败：{str(e)}"
+        if resp.status_code == 200:
+            return True, "服务正常"
+        else:
+            return False, f"服务异常，状态码：{resp.status_code}"
+    except Exception as e:
+        return False, f"连接失败：{str(e)}"
 
 def get_llama_models():
     try:
@@ -68,20 +74,29 @@ def get_llama_models():
         if resp.status_code == 200:
             data = resp.json()
             return [item["id"] for item in data.get("data", [])]
-    except Exception as e: print(f"获取模型列表失败: {e}")
+    except Exception as e:
+        print(f"获取模型列表失败: {e}")
     return []
 
 def is_multimodal(model_name: str) -> bool:
-    if not model_name: return False
-    multimodal_keywords = ["Qwen3","Qwen3.5","qwen3.5","llava","bakllava","gemini","cogvlm","minicpm","deepseek-vl","gemma4","gemma 4"]
-    return any(kw in model_name.lower() for kw in multimodal_keywords)
+    if not model_name:
+        return False
+    multimodal_keywords = [
+        "Qwen3", "Qwen3.5", "qwen3.5", "llava", "bakllava",
+        "gemini", "cogvlm", "minicpm", "deepseek-vl",
+        "gemma4", "gemma 4"
+    ]
+    return any(kw.lower() in model_name.lower() for kw in multimodal_keywords)
 
 def get_model_display_list(models):
     display_list = []
     for m in models:
-        if is_multimodal(m): display_list.append((f"{m} (多模态)", m))
-        elif "deepseek" in m.lower() or "r1" in m.lower(): display_list.append((f"{m} (深度推理)", m))
-        else: display_list.append((m, m))
+        if is_multimodal(m):
+            display_list.append((f"{m} (多模态)", m))
+        elif "deepseek" in m.lower() or "r1" in m.lower():
+            display_list.append((f"{m} (深度推理)", m))
+        else:
+            display_list.append((m, m))
     return display_list
 
 # ==================== 图片编码 ====================
@@ -89,10 +104,16 @@ def encode_image_to_base64(image_path):
     try:
         with Image.open(image_path) as img:
             img_format = img.format.lower() if img.format else None
-            if img_format == "jpg": img_format = "jpeg"
+            if img_format == "jpg":
+                img_format = "jpeg"
         if img_format is None:
             ext = os.path.splitext(image_path)[1].lower()
-            img_format = 'jpeg' if ext in ['.jpg','.jpeg'] else ext[1:]
+            if ext in ['.jpg', '.jpeg']:
+                img_format = 'jpeg'
+            elif ext.startswith('.'):
+                img_format = ext[1:] if ext[1:] else 'jpeg'
+            else:
+                img_format = 'jpeg'
         mime_type = f"image/{img_format}"
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -103,7 +124,6 @@ def encode_image_to_base64(image_path):
 
 # ==================== 思考过程格式化 (升级版) ====================
 def format_thoughts_streaming(thoughts: str) -> str:
-    """流式输出过程中，给思考文字加上标题和简单的分点样式"""
     if not thoughts:
         return ""
     thought_content = re.sub(r'<think>|</think>', '', thoughts).strip()
@@ -114,7 +134,6 @@ def format_thoughts_streaming(thoughts: str) -> str:
     for line in lines:
         line = line.strip()
         if line:
-            # 自动检测引导句，赋予强调样式
             if re.match(r'^(首先|第一|1\.|其次|第二|然后|最后|第三|最终|总结|所以|因此)', line):
                 formatted += f"<em>🔹 {line}</em><br>"
             else:
@@ -122,7 +141,6 @@ def format_thoughts_streaming(thoughts: str) -> str:
     return formatted
 
 def format_thoughts_collapsible(thoughts: str) -> str:
-    """生成结束后，把思考过程放入折叠块，保留原始换行结构"""
     if not thoughts:
         return ""
     thought_content = re.sub(r'<think>|</think>', '', thoughts).strip()
@@ -132,13 +150,11 @@ def format_thoughts_collapsible(thoughts: str) -> str:
     italic_lines = []
     for line in lines:
         if line.strip():
-            # 引导句加粗，其他行正常斜体
             if re.match(r'^(首先|第一|1\.|其次|第二|然后|最后|第三|最终|总结|所以|因此)', line):
                 italic_lines.append(f"🔹 {line}")
             else:
                 italic_lines.append(f"• {line}")
         else:
-            # 空行保留一个 <br> 保持段落间距
             italic_lines.append("<br>")
     content_html = "<br>".join(italic_lines)
     return f'''<details>
@@ -148,7 +164,7 @@ def format_thoughts_collapsible(thoughts: str) -> str:
         </div>
     </details>'''
 
-# ==================== 流式解析器 ====================
+# ==================== 流式解析器 (已修复缓冲区) ====================
 class StreamResponseParser:
     def __init__(self):
         self.thought = ""
@@ -161,13 +177,15 @@ class StreamResponseParser:
         self.char_count = 0
 
     def _clean_text(self, text: str) -> str:
-        if not text: return text
+        if not text:
+            return text
         return text.encode('utf-8', errors='replace').decode('utf-8')
 
     def parse_chunk(self, chunk_data: dict) -> dict:
         result = {"thought": "", "answer": "", "status": "answering"}
         choices = chunk_data.get("choices", [])
-        if not choices: return result
+        if not choices:
+            return result
         delta = choices[0].get("delta", {})
 
         reasoning = delta.get("reasoning_content", "")
@@ -180,7 +198,8 @@ class StreamResponseParser:
             return result
 
         content = delta.get("content", "")
-        if not content: return result
+        if not content:
+            return result
         content = self._clean_text(content)
         self.char_count += len(content)
         self.buffer += content
@@ -200,7 +219,9 @@ class StreamResponseParser:
                     result["status"] = "thinking"
                     continue
                 else:
-                    if self.buffer.endswith('<') or self.buffer.endswith('</t') or self.buffer.endswith('</th'):
+                    think_starts = ['<', '<t', '<th', '<thi', '<thin', '<think']
+                    think_ends = ['</t', '</th']
+                    if any(self.buffer.endswith(p) for p in think_starts + think_ends):
                         keep_len = min(6, len(self.buffer))
                         safe_part = self.buffer[:-keep_len] if len(self.buffer) > keep_len else ""
                         self.buffer = self.buffer[-keep_len:] if len(self.buffer) >= keep_len else self.buffer
@@ -255,8 +276,8 @@ class StreamResponseParser:
 
         return self.answer, self.thought
 
-# ==================== 无记忆流式响应 ====================
-def stream_response_llama(message, image_path, model_name, temperature, max_tokens, gpu_layers,
+# ==================== 无记忆流式响应（已移除无效参数） ====================
+def stream_response_llama(message, image_path, model_name, temperature, max_tokens,
                           system_prompt, vision_mode, thinking_mode, history, request: gr.Request):
     global _stop_flags, _generating_locks
 
@@ -286,12 +307,10 @@ def stream_response_llama(message, image_path, model_name, temperature, max_toke
 
         # 多模态处理
         enable_vision = True
-        force_cpu_vision = False
         if vision_mode == "禁用多模态":
             enable_vision = False
             image_path = None
-        elif vision_mode == "仅 CPU（节省显存）":
-            force_cpu_vision = True
+        # “仅CPU”选项无效，但为了保留界面，我们不做特殊处理
 
         image_data_url = None
         if enable_vision and image_path is not None:
@@ -300,7 +319,7 @@ def stream_response_llama(message, image_path, model_name, temperature, max_toke
                 if not image_data_url:
                     image_path = None
             else:
-                image_path = None  # 忽略图片
+                image_path = None
 
         messages = [{"role": "system", "content": system_prompt}]
         if image_data_url:
@@ -316,21 +335,13 @@ def stream_response_llama(message, image_path, model_name, temperature, max_toke
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if gpu_layers != -1:
-            payload["n_gpu_layers"] = gpu_layers
-        if force_cpu_vision:
-            payload["mmproj_cpu"] = True
-
-        # 思考模式开关
-        payload["chat_template_kwargs"] = {"enable_thinking": thinking_mode}
-        payload["extra_body"] = {"override_kv": {"llama.enable_thinking": thinking_mode}}
+        # 移除 n_gpu_layers、mmproj_cpu、extra_body 等无效字段
 
         timestamp = time.strftime('%H:%M:%S')
         user_content = f"[{timestamp}] 用户：{message}" + (" [附图片]" if image_path else "")
         updated_history = history + [{"role": "user", "content": user_content}]
         updated_history.append({"role": "assistant", "content": f"[{timestamp}] {model_name}："})
-        gpu_display = "服务器默认" if gpu_layers == -1 else str(gpu_layers)
-        yield updated_history, f"模型 [{model_name}] 正在生成... (GPU层数: {gpu_display}, 思考: {'开' if thinking_mode else '关'})"
+        yield updated_history, f"模型 [{model_name}] 正在生成... (思考: {'开' if thinking_mode else '关'})"
 
         parser = StreamResponseParser()
         full_answer = ""
@@ -352,13 +363,16 @@ def stream_response_llama(message, image_path, model_name, temperature, max_toke
                     line = line.strip()
                     if line.startswith("data: "):
                         data_str = line[6:]
-                        if data_str == "[DONE]": continue
+                        if data_str == "[DONE]":
+                            continue
                         try:
                             chunk = json.loads(data_str)
                             parsed = parser.parse_chunk(chunk)
 
-                            if parsed["thought"]: full_thought += parsed["thought"]
-                            if parsed["answer"]: full_answer += parsed["answer"]
+                            if parsed["thought"]:
+                                full_thought += parsed["thought"]
+                            if parsed["answer"]:
+                                full_answer += parsed["answer"]
 
                             display = f"[{timestamp}] {model_name}："
                             thought_formatted = format_thoughts_streaming(full_thought)
@@ -388,22 +402,26 @@ def stream_response_llama(message, image_path, model_name, temperature, max_toke
             final_content = f"[{timestamp}] {model_name}："
             if thought_html:
                 final_content += f"\n{thought_html}\n"
-            final_content += f"{final_answer}\n\n[统计] {stat_str} (GPU层数: {gpu_display})"
-            
+            final_content += f"{final_answer}\n\n[统计] {stat_str}"
+
             updated_history[-1]["content"] = final_content
             yield updated_history, f"生成完成，{stat_str}"
 
         except requests.exceptions.ConnectionError:
             updated_history[-1]["content"] = f"[{timestamp}] {model_name}：连接失败，请确保已运行 llama-server"
             yield updated_history, "连接失败"
+            return
         except Exception as e:
             updated_history[-1]["content"] = f"[{timestamp}] {model_name}：错误：{str(e)}"
             yield updated_history, f"错误：{str(e)}"
+            return
         finally:
             with _stop_lock:
                 _stop_flags.pop(session_id, None)
     finally:
         lock.release()
+        with _generating_lock_dict_lock:
+            _generating_locks.pop(session_id, None)
 
 def stop_generation(request: gr.Request):
     session_id = request.session_hash
@@ -433,23 +451,31 @@ def check_llama_status():
     available, msg = is_llama_available()
     if available:
         models = get_llama_models()
-        if models: return f"✅ llama.cpp 服务正常，可用模型：{', '.join(models[:5])}{'...' if len(models)>5 else ''}"
-        else: return "✅ llama.cpp 服务正常，但未检测到任何模型"
-    else: return f"❌ {msg}"
+        if models:
+            return f"✅ llama.cpp 服务正常，可用模型：{', '.join(models[:5])}{'...' if len(models)>5 else ''}"
+        else:
+            return "✅ llama.cpp 服务正常，但未检测到任何模型"
+    else:
+        return f"❌ {msg}"
 
 def refresh_models():
     models = get_llama_models()
-    if not models: return gr.Dropdown(choices=[("请先启动 llama-server", "none")], value="none")
+    if not models:
+        return gr.Dropdown(choices=[("请先启动 llama-server", "none")], value="none")
     choices = get_model_display_list(models)
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
 # ==================== 角色预设 (外挂 chat_prompts.json) ====================
 def load_prompts():
     json_path = SCRIPT_DIR / "chat_prompts.json"
-    if not json_path.exists(): return {}
+    if not json_path.exists():
+        return {}
     try:
-        with open(json_path, 'r', encoding='utf-8') as f: return json.load(f)
-    except Exception as e: print(f"加载角色配置失败: {e}"); return {}
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"加载角色配置失败: {e}")
+        return {}
 
 def get_prompt_options():
     prompts_data = load_prompts()
@@ -494,21 +520,33 @@ if CATEGORY_NAMES:
     first_role_id = initial_roles[0][0] if initial_roles else ""
     first_role_info = get_role_info(initial_category, first_role_id)
 else:
-    initial_category = ""; initial_roles = []; first_role_id = ""; first_role_info = {}
+    initial_category = ""
+    initial_roles = []
+    first_role_id = ""
+    first_role_info = {}
 
 def open_url(url):
     webbrowser.open(url)
     return f"已打开 {url}"
 
 # ==================== 导出辅助 (复用 file_converter 部分) ====================
-def open_chat_export_dir():
-    CHAT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt": os.startfile(str(CHAT_EXPORT_DIR))
-    else: webbrowser.open(str(CHAT_EXPORT_DIR))
-    return f"已打开导出目录：{CHAT_EXPORT_DIR}"
+def extract_text_from_message_content(content):
+    """从可能为字符串或列表的 content 中提取纯文本"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+        return " ".join(parts)
+    return str(content) if content else ""
 
 def strip_html_tags(text):
-    if not text: return ""
+    if not text:
+        return ""
+    text = extract_text_from_message_content(text)
     text = re.sub(r'<details[^>]*>', '', text)
     text = re.sub(r'</details>', '', text)
     text = re.sub(r'<summary[^>]*>', '', text)
@@ -517,24 +555,50 @@ def strip_html_tags(text):
     return text.strip()
 
 def get_last_assistant_markdown(history):
-    if not history: return ""
+    if not history:
+        return ""
     for msg in reversed(history):
         if msg.get("role") == "assistant":
             return strip_html_tags(msg.get("content", ""))
     return ""
 
 def export_full_chat(history, target_format):
-    if not history: return None, "对话为空"
+    if not history:
+        return None, "对话为空"
     lines = []
     for msg in history:
         role = msg.get("role", "unknown")
-        content = strip_html_tags(msg.get("content", ""))
-        if not content: continue
-        if role == "user": lines.append(f"## 用户\n\n{content}\n\n")
-        else: lines.append(f"## 助手\n\n{content}\n\n")
-    if not lines: return None, "无有效对话内容"
+        raw_content = msg.get("content", "")
+        content = strip_html_tags(raw_content)
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"## 用户\n\n{content}\n\n")
+        else:
+            lines.append(f"## 助手\n\n{content}\n\n")
+    if not lines:
+        return None, "无有效对话内容"
     full_md = "".join(lines)
     return export_content_to_format(full_md, target_format, SCRIPT_DIR.parent)
+
+def open_chat_export_dir():
+    """打开聊天记录导出目录（Windows用资源管理器，其他用浏览器）"""
+    export_dir = CHAT_EXPORT_DIR
+    export_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        os.startfile(str(export_dir))
+    else:
+        webbrowser.open(str(export_dir))
+    return f"已打开导出目录：{export_dir}"
+
+# ==================== 重载函数 ====================
+def apply_reload(model_select, gpu_layers, vision_mode, ctx_size):
+    """点击重载按钮时调用，重启服务并刷新模型列表"""
+    enable_vision = (vision_mode != "禁用多模态")   # 只有明确禁用才关闭视觉
+    ok, msg = restart_server(model_select, int(gpu_layers), enable_vision, int(ctx_size))
+    # 刷新模型下拉列表
+    new_models = refresh_models()
+    return msg, new_models
 
 # ==================== Gradio 界面 ====================
 logo_path = SCRIPT_DIR / "ai_logo.png"
@@ -576,9 +640,6 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
                         }],
                         height=880, sanitize_html=False
                     )
-
-                    thinking_mode_cb = gr.Checkbox(label="开启思考过程（仅深度推理模型生效）", value=True, info="关闭后模型直接输出答案")
-
                     with gr.Row():
                         with gr.Column(scale=3):
                             input_box = gr.Textbox(label="输入文字", placeholder="请输入内容...", lines=14)
@@ -591,6 +652,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
                                 choices=["Microsoft Word (docx)", "PDF", "HTML", "Markdown", "Plain Text"],
                                 label="导出格式", value="Microsoft Word (docx)"
                             )
+                            chat_export_file = gr.File(label="下载对话导出文件", visible=False)
 
                 with gr.Column(scale=1, min_width=280):
                     gr.Markdown("### 角色预设")
@@ -604,9 +666,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
                     model_select = gr.Dropdown(choices=model_choices, value=None, label="选择模型")
                     refresh_btn = gr.Button("🔄 刷新模型列表", size="sm")
 
-                    # 参数预设控件（来自 llama_params_controller）
                     param_controls = create_param_controls()
-                    # 将参数预设事件与控件绑定
                     bind_param_events(param_controls, additional_outputs=[
                         param_controls["temperature"],
                         param_controls["max_tokens"],
@@ -614,6 +674,12 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
                         param_controls["vision_mode"],
                         param_controls["thinking_mode"]
                     ])
+
+                    # 新增上下文大小控制
+                    ctx_size_input = gr.Number(label="上下文大小 (ctx-size)", value=4096, precision=0, minimum=512, maximum=16384, step=128)
+
+                    # 重载按钮
+                    reload_btn = gr.Button("⚡ 应用 GPU/视觉/上下文设置（重载服务）", variant="primary")
 
                     gr.Markdown("---")
                     image_input = gr.Image(label="仅多模态模型支持", type="filepath", height=180)
@@ -630,16 +696,16 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
             send_btn.click(
                 fn=stream_response_llama,
                 inputs=[input_box, image_input, model_select,
-                        param_controls["temperature"], param_controls["max_tokens"], param_controls["gpu_layers"],
-                        system_prompt_box, param_controls["vision_mode"], thinking_mode_cb, history_box],
+                        param_controls["temperature"], param_controls["max_tokens"],
+                        system_prompt_box, param_controls["vision_mode"], param_controls["thinking_mode"], history_box],
                 outputs=[history_box, status_box]
             ).then(lambda: ("", None), None, [input_box, image_input])
 
             input_box.submit(
                 fn=stream_response_llama,
                 inputs=[input_box, image_input, model_select,
-                        param_controls["temperature"], param_controls["max_tokens"], param_controls["gpu_layers"],
-                        system_prompt_box, param_controls["vision_mode"], thinking_mode_cb, history_box],
+                        param_controls["temperature"], param_controls["max_tokens"],
+                        system_prompt_box, param_controls["vision_mode"], param_controls["thinking_mode"], history_box],
                 outputs=[history_box, status_box]
             ).then(lambda: ("", None), None, [input_box, image_input])
 
@@ -647,20 +713,28 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
             clear_btn.click(fn=clear_all, outputs=[history_box, status_box])
             check_btn.click(fn=check_llama_status, outputs=[status_box])
 
+            # 重载按钮事件
+            reload_btn.click(
+                fn=apply_reload,
+                inputs=[model_select, param_controls["gpu_layers"], param_controls["vision_mode"], ctx_size_input],
+                outputs=[status_box, model_select]
+            )
+
             def on_preset_change(role_id):
                 if not role_id:
-                    return "你是一个乐于助人的助手，请用中文回答用户的问题。", gr.Textbox(placeholder="请输入内容...")
+                    return "你是一个乐于助人的助手，请用中文回答用户的问题。", gr.update(placeholder="请输入内容...")
                 prompt, placeholder = apply_preset(role_id)
-                return prompt, gr.Textbox(placeholder=placeholder)
+                return prompt, gr.update(placeholder=placeholder)
 
             role_dropdown.change(fn=on_preset_change, inputs=[role_dropdown], outputs=[system_prompt_box, input_box])
 
             def handle_export(history, fmt):
                 path, msg = export_full_chat(history, fmt)
-                if path: return f"✅ {msg}\n文件位置：{path}"
-                return f"❌ {msg}"
+                if path:
+                    return gr.update(value=path, visible=True), f"✅ {msg}\n文件位置：{path}"
+                return gr.update(visible=False), f"❌ {msg}"
 
-            export_btn.click(fn=handle_export, inputs=[history_box, export_format], outputs=[status_box])
+            export_btn.click(fn=handle_export, inputs=[history_box, export_format], outputs=[chat_export_file, status_box])
             open_export_dir_btn.click(fn=open_chat_export_dir, outputs=[status_box])
 
         # ==================== Tab2: 转换工具 ====================
@@ -689,9 +763,11 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
                     extract_btn.click(fn=get_last_assistant_markdown, inputs=[history_box], outputs=[markdown_input])
 
                     def handle_export_md(md_text, fmt):
-                        if not md_text.strip(): return None, "请先提取或输入 Markdown 内容。"
+                        if not md_text.strip():
+                            return None, "请先提取或输入 Markdown 内容。"
                         path, msg = export_content_to_format(md_text, fmt, SCRIPT_DIR.parent)
-                        if path: return (gr.update(value=path, visible=True), msg)
+                        if path:
+                            return (gr.update(value=path, visible=True), msg)
                         return (gr.update(visible=False), msg)
 
                     export_md_btn.click(fn=handle_export_md, inputs=[markdown_input, target_export_format],
@@ -836,7 +912,7 @@ with gr.Blocks(title="轻舟 AI・无记忆聊天 (llama.cpp, 外挂模块)", cs
 if __name__ == "__main__":
     print("=" * 60)
     print("启动 轻舟 AI・无记忆聊天 (llama.cpp 后端, 外挂模块)")
-    print("请确保已运行 llama-server")
+    print("请确保已运行 llama-server 或使用重载按钮启动")
     print("=" * 60)
     port = 7961
     demo.launch(
@@ -844,6 +920,5 @@ if __name__ == "__main__":
         server_port=port,
         share=False,
         inbrowser=True,
-        css=css,
         favicon_path=str(ico_path) if ico_path.exists() else None
     )

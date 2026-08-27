@@ -8,6 +8,7 @@ ai_buddy_llama.py - 基于 llama.cpp 后端的 AI 助手（聊天 + 转换工具
   3. 聊天记录提取时避免 html.unescape 导致实体错误
   4. 思考标签残留清理正则优化
   5. 其他微小调整（Pandoc 路径跨平台提示等）
+  6. 支持通过重载服务动态调整 GPU 层数、上下文大小、视觉开关
 Copyright 2026 光影的故事2018
 """
 
@@ -33,6 +34,9 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image, ImageOps
+
+# ---------- 导入重载管理模块 ----------
+from llama_server_manager import restart_server
 
 # 全局脚本目录
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -376,9 +380,7 @@ class StreamResponseParser:
         return result
 
     def finalize(self, usage=None):
-        # 改进残留标签清理正则，可以处理不完整的 <think> </think>
         if self.buffer:
-            # 移除尾部可能残留的标签部分
             self.buffer = re.sub(r'</?t(h(i(n(k)?)?)?)?$', '', self.buffer)
             self.buffer = re.sub(r'^/?t(h(i(n(k)?)?)?)?$', '', self.buffer)
             if self.in_think_tag:
@@ -404,6 +406,45 @@ class StreamResponseParser:
         self.start_time = time.time()
         self.total_tokens = 0
         self.char_count = 0
+
+# ==================== 重载函数 ====================
+def apply_reload(model_select, gpu_layers, vision_mode, ctx_size):
+    """点击重载按钮时调用，重启服务并刷新模型列表"""
+    enable_vision = (vision_mode != "禁用多模态")
+    ok, msg = restart_server(model_select, int(gpu_layers), enable_vision, int(ctx_size))
+    # 刷新模型下拉列表
+    models = get_llama_models()
+    if not models:
+        return msg, gr.update(choices=[("请先启动 llama-server", "none")], value="none")
+    choices = []
+    for m in models:
+        if is_multimodal(m):
+            choices.append((f"{m} (多模态)", m))
+        else:
+            choices.append((m, m))
+    return msg, gr.update(choices=choices, value=choices[0][1] if choices else None)
+
+def get_llama_models() -> List[str]:
+    """获取模型列表（供重载函数使用）"""
+    try:
+        resp = requests.get("http://127.0.0.1:8080/v1/models", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = [item["id"] for item in data.get("data", [])]
+            return models
+    except Exception as e:
+        print(f"获取模型列表失败: {e}")
+    return []
+
+def is_multimodal(model_name: str) -> bool:
+    if not model_name:
+        return False
+    multimodal_keywords = [
+        "Qwen3", "Qwen3.5", "llava", "bakllava", "gemini",
+        "cogvlm", "minicpm", "deepseek-vl", "gemma4", "gemma 4",
+        "glm-4v", "fuyu", "idefics", "llava-next", "florence", "paligemma"
+    ]
+    return any(kw.lower() in model_name.lower() for kw in multimodal_keywords)
 
 # ========== AI 对话核心 ==========
 class AIBuddy:
@@ -510,10 +551,18 @@ class AIBuddy:
                 for sid in self._stop_flags:
                     self._stop_flags[sid] = True
 
-    def stream_chat(self, message: str, image_path: Optional[str], model: str = None,
-                    temperature: float = 0.5, max_tokens: int = 1024,
-                    n_gpu_layers: int = -1, vision_mode: str = "自动（跟随 GPU 层数）",
-                    thinking_mode: bool = True, session_id: str = None):
+    def stream_chat(
+        self,
+        message: str,
+        image_path: Optional[str],
+        model: str = None,
+        temperature: float = 0.5,
+        max_tokens: int = 1024,
+        vision_mode: str = "自动（跟随 GPU 层数）",
+        thinking_mode: bool = True,
+        session_id: str = None
+    ):
+        """流式聊天（不再接收 n_gpu_layers，由服务启动参数控制）"""
         if not session_id:
             session_id = f"session_{uuid.uuid4().hex[:8]}"
         self.stop_streaming(session_id)
@@ -526,12 +575,9 @@ class AIBuddy:
             return
 
         enable_vision = True
-        force_cpu_vision = False
         if vision_mode == "禁用多模态":
             enable_vision = False
             image_path = None
-        elif vision_mode == "仅 CPU（节省显存）":
-            force_cpu_vision = True
 
         image_data_url = None
         if enable_vision and image_path and os.path.exists(image_path):
@@ -556,12 +602,7 @@ class AIBuddy:
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        if n_gpu_layers >= 0:
-            payload["n_gpu_layers"] = n_gpu_layers
-        if force_cpu_vision:
-            payload["mmproj_cpu"] = True
-        payload["chat_template_kwargs"] = {"enable_thinking": thinking_mode}
-        payload["extra_body"] = {"override_kv": {"llama.enable_thinking": thinking_mode}}
+        # 移除 n_gpu_layers、mmproj_cpu、extra_body——这些由服务启动参数控制
 
         response = None
         try:
@@ -745,9 +786,7 @@ def strip_html_tags(text) -> str:
         return ""
     if not isinstance(text, str):
         text = str(text)
-    # 先解码 HTML 实体（如 &amp; → &），再进行标签移除
     text = html.unescape(text)
-    # 移除所有 HTML 标签
     text = re.sub(r'<details[^>]*>', '', text)
     text = re.sub(r'</details>', '', text)
     text = re.sub(r'<summary[^>]*>', '', text)
@@ -765,7 +804,6 @@ def strip_html_tags(text) -> str:
 def detect_chinese_font():
     """跨平台检测中文字体"""
     if os.name == "nt":
-        # Windows 常用中文字体
         for font in ["SimSun", "Microsoft YaHei", "SimHei"]:
             try:
                 result = subprocess.run(["fc-list", f":family={font}"], capture_output=True, text=True, timeout=2)
@@ -824,7 +862,6 @@ def export_single_markdown(markdown_text: str, target_format: str):
         return None, "内容为空，无法导出。"
     markdown_text = fix_markdown_table_separator(markdown_text)
     CHAT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    # 使用全局 SUPPORTED_FORMATS 获取扩展名
     tgt_ext = SUPPORTED_FORMATS.get(target_format, ".docx")
     writer = FORMAT_ALIASES.get(tgt_ext, "docx")
     pdf_engine = None
@@ -887,7 +924,6 @@ def export_single_markdown(markdown_text: str, target_format: str):
                 last_error = err2
     if success:
         return str(output_path), f"导出成功：{output_path.name}"
-    # Pandoc 失败时降级为纯文本
     try:
         txt_path = CHAT_EXPORT_DIR / f"export_{timestamp}.txt"
         with open(txt_path, 'w', encoding='utf-8') as f:
@@ -1324,12 +1360,31 @@ def create_chat_interface(ai_buddy, personality_config, config):
                         minimum=128, maximum=8192, value=2048, step=128,
                         label="最大长度", info="控制回答的最大长度"
                     )
+
+                    # ---------- 新增：GPU层数、上下文、视觉模式（重载生效） ----------
+                    gr.Markdown("### 启动参数控制（重载生效）")
                     gpu_layers_slider = gr.Slider(
                         minimum=-1, maximum=99, value=-1, step=1,
-                        label="GPU 层数", info="-1=服务器默认，0=纯CPU，99=全GPU（需服务器支持）"
+                        label="GPU 层数",
+                        info="-1=服务器默认，0=纯CPU，99=全GPU"
                     )
+                    ctx_size_input = gr.Number(
+                        label="上下文大小 (ctx-size)",
+                        value=4096,
+                        precision=0,
+                        minimum=512,
+                        maximum=16384,
+                        step=128
+                    )
+                    vision_mode = gr.Dropdown(
+                        choices=["自动（启用视觉）", "禁用多模态"],
+                        value="自动（启用视觉）",
+                        label="视觉模型模式"
+                    )
+                    reload_btn = gr.Button("⚡ 应用 GPU/视觉/上下文设置（重载服务）", variant="primary")
+                    gr.Markdown("---")
 
-                    # 参数预设 Accordion
+                    # ---------- 参数预设 Accordion ----------
                     with gr.Accordion("⚙️ 参数预设", open=False):
                         preset_dropdown = gr.Dropdown(
                             choices=get_preset_choices(),
@@ -1351,11 +1406,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
                         label="开启思考过程（仅深度推理模型生效）",
                         value=True,
                         info="关闭后强制禁用 think 标签，模型直接输出答案"
-                    )
-                    vision_mode = gr.Dropdown(
-                        choices=["自动（跟随 GPU 层数）", "仅 CPU（节省显存）", "禁用多模态"],
-                        value="自动（跟随 GPU 层数）",
-                        label="视觉模型模式"
                     )
                     check_service_btn = gr.Button("检查 llama.cpp 服务", variant="secondary", size="sm")
                     chat_image_input = gr.Image(
@@ -1395,6 +1445,13 @@ def create_chat_interface(ai_buddy, personality_config, config):
             new_dropdown = refresh_model_list()
             return model_info, new_dropdown
 
+        # ---------- 重载按钮事件 ----------
+        reload_btn.click(
+            fn=apply_reload,
+            inputs=[model_choice, gpu_layers_slider, vision_mode, ctx_size_input],
+            outputs=[status_display, model_choice]
+        )
+
         def apply_custom_prompt(prompt_text):
             ai_buddy.personality.set_custom_system_prompt(prompt_text)
             return "✅ 自定义系统提示词已应用"
@@ -1403,7 +1460,9 @@ def create_chat_interface(ai_buddy, personality_config, config):
             ai_buddy.personality.set_custom_system_prompt("")
             return "", "✅ 已重置为性格预设"
 
-        def start_streaming(message, image, history_html, model, temperature, max_tokens, gpu_layers, vision, thinking, current_session_id):
+        def start_streaming(message, image, history_html, model, temperature, max_tokens,
+                            vision, thinking, current_session_id):
+            # 注意：移除了 gpu_layers 参数
             if current_session_id:
                 ai_buddy.stop_streaming(current_session_id)
             new_session_id = f"chat_{uuid.uuid4().hex[:8]}"
@@ -1423,7 +1482,7 @@ def create_chat_interface(ai_buddy, personality_config, config):
             current_html = history_html + user_html
             yield current_html, f"正在生成回复... (温度: {temperature}, 最大长度: {max_tokens})", new_session_id
             for full_response, status_msg, is_streaming in ai_buddy.stream_chat(
-                    clean_message, image, model, temperature, max_tokens, gpu_layers, vision, thinking, new_session_id):
+                    clean_message, image, model, temperature, max_tokens, vision, thinking, new_session_id):
                 if full_response:
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     ai_html = f'''<div class="ai-message">
@@ -1507,18 +1566,18 @@ def create_chat_interface(ai_buddy, personality_config, config):
             }
             return preset_map.get(preset_str, "")
 
-        # 绑定事件（关键：所有需要更新下拉框的地方都用 return gr.update(...)）
+        # ========== 绑定事件 ==========
         send_btn.click(
             fn=start_streaming,
             inputs=[user_input, chat_image_input, chat_history, model_choice,
-                    temperature_slider, max_tokens_slider, gpu_layers_slider, vision_mode, thinking_mode_cb, session_state],
+                    temperature_slider, max_tokens_slider, vision_mode, thinking_mode_cb, session_state],
             outputs=[chat_history, status_display, session_state]
         ).then(lambda: ("", None), None, [user_input, chat_image_input])
 
         user_input.submit(
             fn=start_streaming,
             inputs=[user_input, chat_image_input, chat_history, model_choice,
-                    temperature_slider, max_tokens_slider, gpu_layers_slider, vision_mode, thinking_mode_cb, session_state],
+                    temperature_slider, max_tokens_slider, vision_mode, thinking_mode_cb, session_state],
             outputs=[chat_history, status_display, session_state]
         ).then(lambda: ("", None), None, [user_input, chat_image_input])
 
@@ -1544,7 +1603,6 @@ def create_chat_interface(ai_buddy, personality_config, config):
         export_presets_btn.click(fn=export_presets, outputs=[export_file])
         import_presets_btn.upload(fn=import_presets, inputs=[import_presets_btn], outputs=[preset_dropdown])
 
-    # 返回组件引用，以便主界面可以使用 initial_refresh
     return model_choice, status_display
 
 def create_converter_tab(ai_buddy):
@@ -1698,7 +1756,6 @@ def create_interface():
         </div>
         """)
 
-        # 启动时自动检查服务并填充模型列表（使用 gr.update）
         def initial_refresh():
             available, msg = ai_buddy.is_llama_available()
             models = ai_buddy.get_llama_models() if available else []
@@ -1783,7 +1840,6 @@ def main():
             ai_buddy.memory_manager.shutdown()
 
 if __name__ == "__main__":
-    # 如果 presets.json 不存在，则创建默认预设
     if not PRESETS_FILE.exists():
         default_presets = [
             {
@@ -1799,7 +1855,7 @@ if __name__ == "__main__":
                 "temperature": 0.8,
                 "max_tokens": 4096,
                 "gpu_layers": 99,
-                "vision_mode": "自动（跟随 GPU 层数）",
+                "vision_mode": "自动（启用视觉）",
                 "thinking_mode": True
             }
         ]

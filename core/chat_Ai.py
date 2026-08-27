@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-chat_llama.py - 基于 llama.cpp 后端的聊天助手（支持记忆、流式、思考过程、多模态）
+轻舟 AI・LightShip AI - chat_Ai.py (llama.cpp 后端，有记忆)
+支持记忆、流式、思考过程、多模态、动态重载服务
 外挂 JSON：在线AI入口提示词模板动态加载
 Copyright 2026 光影的故事2018
 """
@@ -25,6 +26,9 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+
+# ---------- 导入重载管理模块 ----------
+from llama_server_manager import restart_server
 
 # ==================== 全局停止标志与并发锁 ====================
 _stop_flags = {}
@@ -157,7 +161,6 @@ def load_prompts():
         return {}
 
 def get_prompt_options():
-    """从角色库生成在线AI入口的提示词模板下拉菜单选项"""
     prompts_data = load_prompts()
     role_lib = prompts_data.get("角色库", {})
     options = []
@@ -168,7 +171,6 @@ def get_prompt_options():
     return options
 
 def get_prompt_text(role_id):
-    """根据角色ID返回对应的系统提示词文本"""
     prompts_data = load_prompts()
     role_lib = prompts_data.get("角色库", {})
     for category, roles in role_lib.items():
@@ -176,19 +178,16 @@ def get_prompt_text(role_id):
             return roles[role_id]["系统提示词"]
     return ""
 
-# 兼容原 update_prompt 的调用方式，现在直接返回文本
 def update_prompt(role_id):
     return get_prompt_text(role_id)
 
 def get_role_info(category, role_id):
-    """返回指定分类下角色的完整信息"""
     prompts_data = load_prompts()
     role_lib = prompts_data.get("角色库", {})
     roles = role_lib.get(category, {})
     return roles.get(role_id, {})
 
 def build_category_roles_map():
-    """构建 {分类名: [(角色ID, 角色显示名), ...]} 的映射"""
     mapping = {}
     prompts_data = load_prompts()
     cat_list = prompts_data.get("分类目录", {})
@@ -199,7 +198,6 @@ def build_category_roles_map():
         mapping[cat_name] = pairs
     return mapping
 
-# 生成静态变量供界面使用
 CATEGORY_ROLES_MAP = build_category_roles_map()
 CATEGORY_NAMES = list(CATEGORY_ROLES_MAP.keys())
 if CATEGORY_NAMES:
@@ -219,12 +217,10 @@ def open_url(url):
 
 def encode_image_to_base64(image_path):
     try:
-        # 直接尝试打开图片，PIL 自动校验文件合法性
         with Image.open(image_path) as img:
             img_format = img.format.lower() if img.format else None
             if img_format == "jpg":
                 img_format = "jpeg"
-        
         if img_format is None:
             ext = os.path.splitext(image_path)[1].lower()
             if ext in ['.jpg', '.jpeg']:
@@ -235,7 +231,6 @@ def encode_image_to_base64(image_path):
                 img_format = 'gif'
             else:
                 img_format = 'jpeg'
-        
         mime_type = f"image/{img_format}"
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -368,13 +363,12 @@ class StreamResponseParser:
             self.total_tokens = self.char_count // 2
         return self.answer, self.thought
 
-def stream_response(message, image_path, model_name, temperature, max_tokens, gpu_layers,
+# ==================== 流式响应（移除无效参数） ====================
+def stream_response(message, image_path, model_name, temperature, max_tokens,
                     system_prompt, vision_mode, thinking_mode, history, request: gr.Request):
     global _stop_flags, _generating_locks
 
     session_id = request.session_hash
-
-    # 并发控制：同一会话同时只允许一个生成任务
     with _generating_lock_dict_lock:
         if session_id not in _generating_locks:
             _generating_locks[session_id] = threading.Lock()
@@ -404,8 +398,7 @@ def stream_response(message, image_path, model_name, temperature, max_tokens, gp
         if vision_mode == "禁用多模态":
             enable_vision = False
             image_path = None
-        elif vision_mode == "仅 CPU（节省显存）":
-            force_cpu_vision = True
+        # “仅CPU”模式实际无效，但保留选项
         image_data_url = None
         if enable_vision and image_path is not None:
             if is_multimodal(model_name):
@@ -423,28 +416,22 @@ def stream_response(message, image_path, model_name, temperature, max_tokens, gp
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if gpu_layers >= 0:
-            payload["n_gpu_layers"] = gpu_layers
-        if force_cpu_vision:
-            payload["mmproj_cpu"] = True
+        # 移除 n_gpu_layers、mmproj_cpu、extra_body 等无效字段
 
+        # 思考模式通过 chat_template_kwargs 传递（某些服务端支持）
         payload["chat_template_kwargs"] = {"enable_thinking": thinking_mode}
-        payload["extra_body"] = {
-            "override_kv": {
-                "llama.enable_thinking": thinking_mode
-            }
-        }
+        # 如果服务端不支持 extra_body，可移除，但保留无害
 
         timestamp = time.strftime('%H:%M:%S')
-        
         user_content = f"[{timestamp}] 用户：{message}" + (" [附图片]" if image_path else "")
         updated_history = history + [{"role": "user", "content": user_content}]
         updated_history.append({"role": "assistant", "content": f"[{timestamp}] {model_name}："})
-        gpu_info = f"(GPU层数: {gpu_layers})" if gpu_layers >= 0 else "(GPU层数: 服务器默认)"
-        yield updated_history, f"模型 [{model_name}] 正在生成... {gpu_info}"
+        yield updated_history, f"模型 [{model_name}] 正在生成..."
+
         parser = StreamResponseParser()
         full_answer = ""
         full_thought = ""
+
         try:
             response = requests.post(LLAMA_API_URL, json=payload, stream=True, timeout=180)
             response.raise_for_status()
@@ -496,7 +483,7 @@ def stream_response(message, image_path, model_name, temperature, max_tokens, gp
     {thought_html}
     {final_answer}
     <div style="margin-top: 15px; color: #888; font-size: 0.85em;">
-        [统计] {stat_str} {gpu_info}
+        [统计] {stat_str}
     </div>
     """
             updated_history[-1]["content"] = final_content
@@ -532,7 +519,7 @@ def clear_all():
 3. 温度控制创意度，最大长度控制回复长度
 4. 对话自动记忆最近10轮
 5. 可随时停止生成
-6. 调整 GPU 层数（-1=默认，0=纯CPU，99=全GPU）需服务器支持
+6. 可在右侧调整 GPU 层数、上下文后点击「重载」生效
 
 开始对话："""
     }]
@@ -543,11 +530,11 @@ def check_llama_status():
     if available:
         models = get_llama_models()
         if models:
-            return f"llama.cpp 服务正常，可用模型：{', '.join(models[:5])}{'...' if len(models)>5 else ''}"
+            return f"✅ llama.cpp 服务正常，可用模型：{', '.join(models[:5])}{'...' if len(models)>5 else ''}"
         else:
-            return "llama.cpp 服务正常，但未检测到任何模型"
+            return "✅ llama.cpp 服务正常，但未检测到任何模型"
     else:
-        return f"{msg}"
+        return f"❌ {msg}"
 
 def refresh_models():
     models = get_llama_models()
@@ -555,6 +542,15 @@ def refresh_models():
         return gr.Dropdown(choices=[("请先启动 llama-server", "none")], value="none")
     choices = get_model_display_list(models)
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
+
+# ==================== 重载函数 ====================
+def apply_reload(model_select, gpu_layers, vision_mode, ctx_size):
+    """点击重载按钮时调用，重启服务并刷新模型列表"""
+    enable_vision = (vision_mode != "禁用多模态")   # 只有明确禁用才关闭视觉
+    ok, msg = restart_server(model_select, int(gpu_layers), enable_vision, int(ctx_size))
+    # 刷新模型下拉列表
+    new_models = refresh_models()
+    return msg, new_models
 
 # ==================== 参数预设管理（外挂 JSON） ====================
 PRESETS_FILE = Path(SCRIPT_DIR) / "presets.json"
@@ -645,7 +641,6 @@ def import_presets(file):
     return gr.Dropdown(choices=get_preset_choices(), value=None)
 
 def format_thoughts_streaming(thoughts: str) -> str:
-    """流式输出时，给思考文字加上标题和分点样式"""
     if not thoughts:
         return ""
     thought_content = re.sub(r'<think>|</think>', '', thoughts).strip()
@@ -656,7 +651,6 @@ def format_thoughts_streaming(thoughts: str) -> str:
     for line in lines:
         line = line.strip()
         if line:
-            # 引导句用强调样式
             if re.match(r'^(首先|第一|1\.|其次|第二|然后|最后|第三|最终|总结|所以|因此)', line):
                 formatted += f"<em>🔹 {line}</em><br>"
             else:
@@ -664,7 +658,6 @@ def format_thoughts_streaming(thoughts: str) -> str:
     return formatted
 
 def format_thoughts_collapsible(thoughts: str) -> str:
-    """生成结束后，把思考过程放入折叠块，保留层级结构"""
     if not thoughts:
         return ""
     thought_content = re.sub(r'<think>|</think>', '', thoughts).strip()
@@ -779,7 +772,6 @@ def convert_docs(files, src_format, tgt_format, enable_toc, reference_doc):
     elif tgt_ext == ".docx":
         if enable_toc:
             extra_args.append("--toc")
-        # 安全获取 reference_doc 的路径
         if reference_doc is not None:
             ref_path = None
             if isinstance(reference_doc, str):
@@ -855,7 +847,6 @@ def convert_images_func(files, target_format, quality):
             counter += 1
         try:
             img = Image.open(in_path)
-            # 自动旋转
             from PIL import ImageOps
             img = ImageOps.exif_transpose(img)
             if target_format in ["JPEG", "WebP"]:
@@ -1061,7 +1052,7 @@ css = """
 }
 """
 
-with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
+with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)", css=css) as demo:
     with gr.Row():
         if os.path.exists(logo_path):
             gr.Image(logo_path, height=50, show_label=False, container=False, scale=0)
@@ -1087,7 +1078,7 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
 3. 温度控制创意度，最大长度控制回复长度
 4. 对话自动记忆最近10轮
 5. 可随时停止生成
-6. 调整 GPU 层数（-1=默认，0=纯CPU，99=全GPU）需服务器支持
+6. 可在右侧调整 GPU 层数、上下文后点击「重载」生效
 
 开始对话："""
                         }],
@@ -1130,11 +1121,24 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
                     refresh_btn = gr.Button("刷新模型列表", size="sm")
                     temp_slider = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="温度")
                     token_slider = gr.Slider(512, 8192, value=2048, step=128, label="最大长度")
+                    
+                    # 新增：GPU层数和上下文大小控制（用于重载）
                     gpu_layers_slider = gr.Slider(
                         -1, 99, value=-1, step=1,
-                        label="GPU 层数 (-1=默认, 0=纯CPU, 99=全GPU)",
-                        info="需 llama-server 支持请求级设置"
+                        label="GPU 层数（重载生效）",
+                        info="-1=默认, 0=纯CPU, 99=全GPU"
                     )
+                    ctx_size_input = gr.Number(
+                        label="上下文大小 (ctx-size，重载生效)",
+                        value=4096,
+                        precision=0,
+                        minimum=512,
+                        maximum=16384,
+                        step=128
+                    )
+                    
+                    # 重载按钮
+                    reload_btn = gr.Button("⚡ 应用 GPU/视觉/上下文设置（重载服务）", variant="primary")
                     
                     # 折叠面板：参数预设
                     with gr.Accordion("⚙️ 参数预设", open=False):
@@ -1151,13 +1155,13 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
                         with gr.Row():
                             export_presets_btn = gr.Button("⬇️ 导出预设", size="sm")
                             import_presets_btn = gr.UploadButton("⬆️ 导入预设", file_types=[".json"], size="sm")
-                            export_file = gr.File(visible=False)  # 用于导出                    
+                            export_file = gr.File(visible=False)
                     
                     gr.Markdown("---")
                     thinking_mode_cb = gr.Checkbox(
                         label="开启思考过程（仅深度推理模型生效）",
                         value=True,
-                        info="关闭后强制禁用  标签，模型直接输出答案"
+                        info="关闭后强制禁用 <think> 标签，模型直接输出答案"
                     )
                     gr.Markdown("### 多模态设置")             
                     vision_mode = gr.Dropdown(
@@ -1179,23 +1183,31 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
             with gr.Row():
                 status_box = gr.Textbox(label="状态", value="就绪", interactive=False, lines=3)
 
+            # ---------- 事件绑定 ----------
             refresh_btn.click(fn=refresh_models, outputs=[model_select])
             send_btn.click(
                 fn=stream_response,
                 inputs=[input_box, image_input, model_select, temp_slider, token_slider,
-                        gpu_layers_slider, system_prompt_box, vision_mode, thinking_mode_cb, history_box],
+                        system_prompt_box, vision_mode, thinking_mode_cb, history_box],
                 outputs=[history_box, status_box]
             ).then(lambda: ("", None), None, [input_box, image_input])
             input_box.submit(
                 fn=stream_response,
                 inputs=[input_box, image_input, model_select, temp_slider, token_slider,
-                        gpu_layers_slider, system_prompt_box, vision_mode, thinking_mode_cb, history_box],
+                        system_prompt_box, vision_mode, thinking_mode_cb, history_box],
                 outputs=[history_box, status_box]
             ).then(lambda: ("", None), None, [input_box, image_input])
             stop_btn.click(fn=stop_generation, outputs=[status_box])
             clear_btn.click(fn=clear_all, outputs=[history_box, status_box])
             check_btn.click(fn=check_llama_status, outputs=[status_box])
             demo.load(fn=check_llama_status, outputs=[status_box])
+
+            # 重载按钮事件
+            reload_btn.click(
+                fn=apply_reload,
+                inputs=[model_select, gpu_layers_slider, vision_mode, ctx_size_input],
+                outputs=[status_box, model_select]
+            )
 
             def handle_chat_export(history, fmt):
                 path, msg = export_full_chat(history, fmt)
@@ -1351,7 +1363,6 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
             gr.Markdown("---")
             gr.Markdown("### 智能提示词模板（动态加载）")
 
-            # 分类选择
             with gr.Row():
                 category_dd = gr.Dropdown(
                     label="选择分类",
@@ -1366,7 +1377,6 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
                     interactive=True
                 )
 
-            # 当前角色的提示词与占位符
             current_prompt = gr.Textbox(
                 label="系统提示词",
                 value=first_role_info.get("系统提示词", ""),
@@ -1381,7 +1391,6 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
 
             gr.Markdown("使用方法：选择分类和角色 → 复制提示词/占位符 → 点击上方按钮打开 AI 网站 → 粘贴使用。")
 
-            # 联动更新角色列表（使用 gr.update 修复）
             def on_category_change(cat):
                 roles = CATEGORY_ROLES_MAP.get(cat, [])
                 if roles:
@@ -1444,8 +1453,7 @@ with gr.Blocks(title="轻舟 AI・LightShip AI (llama.cpp)") as demo:
 if __name__ == "__main__":
     print("=" * 60)
     print("启动 轻舟 AI・LightShip AI (llama.cpp 后端)")
-    print("请确保已运行 llama-server，例如：")
-    print("llama-server.exe -m model.gguf --host 0.0.0.0 --port 8080")
+    print("请确保已运行 llama-server，或使用重载按钮启动")
     print("=" * 60)
 
     status = check_llama_status()
